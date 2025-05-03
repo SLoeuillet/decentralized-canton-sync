@@ -3,37 +3,34 @@
 
 package org.lfdecentralizedtrust.splice.integration.tests
 
+import cats.instances.future.*
+import cats.instances.seq.*
+import cats.syntax.foldable.*
+import com.digitalasset.canton.config.RequireTypes.PositiveInt
+import com.digitalasset.canton.topology.{MediatorId, SequencerId}
+import com.digitalasset.canton.topology.admin.grpc.TopologyStoreId
+import org.lfdecentralizedtrust.splice.codegen.java.da.time.types.RelTime
 import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.*
 import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.actionrequiringconfirmation.ARC_DsoRules
 import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.dsorules_actionrequiringconfirmation.{
-  SRARC_OffboardSv,
   SRARC_CreateTransferCommandCounter,
+  SRARC_OffboardSv,
 }
 import org.lfdecentralizedtrust.splice.config.ConfigTransforms
 import org.lfdecentralizedtrust.splice.config.ConfigTransforms.{
-  updateAutomationConfig,
   ConfigurableApp,
+  updateAutomationConfig,
 }
-import org.lfdecentralizedtrust.splice.environment.EnvironmentImpl
 import org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition
-import org.lfdecentralizedtrust.splice.integration.tests.SpliceTests.{
-  IntegrationTest,
-  SpliceTestConsoleEnvironment,
-}
+import org.lfdecentralizedtrust.splice.integration.tests.SpliceTests.IntegrationTest
+import org.lfdecentralizedtrust.splice.sv.automation.delegatebased.ExecuteConfirmedActionTrigger
 import org.lfdecentralizedtrust.splice.sv.automation.singlesv.LocalSequencerConnectionsTrigger
 import org.lfdecentralizedtrust.splice.sv.automation.singlesv.offboarding.{
   SvOffboardingMediatorTrigger,
   SvOffboardingSequencerTrigger,
 }
-import org.lfdecentralizedtrust.splice.sv.automation.delegatebased.ExecuteConfirmedActionTrigger
 import org.lfdecentralizedtrust.splice.util.{ProcessTestUtil, StandaloneCanton}
-import com.digitalasset.canton.config.RequireTypes.PositiveInt
-import com.digitalasset.canton.integration.BaseEnvironmentDefinition
-import com.digitalasset.canton.topology.{MediatorId, SequencerId}
 import org.scalatest.time.{Minute, Span}
-import cats.syntax.foldable.*
-import cats.instances.future.*
-import cats.instances.seq.*
 
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -52,8 +49,9 @@ class SvOffboardingIntegrationTest
   override lazy val resetRequiredTopologyState = false
 
   override implicit val patienceConfig: PatienceConfig = PatienceConfig(scaled(Span(1, Minute)))
-  override def environmentDefinition
-      : BaseEnvironmentDefinition[EnvironmentImpl, SpliceTestConsoleEnvironment] =
+  // the port overrides below trip the HTTP one
+  override protected def runTokenStandardCliSanityCheck: Boolean = false
+  override def environmentDefinition: SpliceEnvironmentDefinition =
     EnvironmentDefinition
       .simpleTopology4Svs(this.getClass.getSimpleName)
       .withPreSetup(_ => ())
@@ -116,7 +114,6 @@ class SvOffboardingIntegrationTest
         sv1Backend.participantClient.ledger_api_extensions.commands.submitJava(
           actAs = Seq(sv1Backend.getDsoInfo().svParty),
           readAs = Seq(sv1Backend.getDsoInfo().dsoParty),
-          optTimeout = None,
           commands = externalPartyAmuletRules.contractId
             .exerciseExternalPartyAmuletRules_CreateTransferCommand(
               sv1Backend.getDsoInfo().svParty.toProtoPrimitive,
@@ -129,7 +126,7 @@ class SvOffboardingIntegrationTest
             .commands
             .asScala
             .toSeq,
-          applicationId = sv1Backend.config.ledgerApiUser,
+          userId = sv1Backend.config.ledgerApiUser,
         ),
       )(
         "Wait for 4 confirmations to be created for creating transfer command counter",
@@ -161,7 +158,8 @@ class SvOffboardingIntegrationTest
             action,
             "https://vote-request-url.com",
             "description",
-            sv1Backend.getDsoInfo().dsoRules.payload.config.voteRequestTimeout,
+            new RelTime(durationUntilExpiration.toMillis * 1000),
+            Some(env.environment.clock.now.add(durationUntilOffboardingEffectivity).toInstant),
           )
         },
       )(
@@ -201,7 +199,7 @@ class SvOffboardingIntegrationTest
         },
       )
 
-      actAndCheck(
+      actAndCheck(timeUntilSuccess = 40.seconds)(
         // We need SV4's vote here for immediate offboarding
         "SV3 and SV4 vote on removing sv4", {
           sv3Backend.castVote(voteRequestCid4, true, "https://vote-request-url.com", "description")
@@ -261,7 +259,7 @@ class SvOffboardingIntegrationTest
               val decentralizedNamespaces =
                 sv1Backend.participantClient.topology.decentralized_namespaces
                   .list(
-                    filterStore = decentralizedSynchronizerId.filterString,
+                    store = TopologyStoreId.Synchronizer(decentralizedSynchronizerId),
                     filterNamespace = dsoParty.uid.namespace.toProtoPrimitive,
                   )
               inside(decentralizedNamespaces) { case Seq(decentralizedNamespace) =>
@@ -278,7 +276,7 @@ class SvOffboardingIntegrationTest
             clue("Check mediator offboarding") {
               val mediators =
                 sv3Backend.appState.participantAdminConnection
-                  .getMediatorDomainState(decentralizedSynchronizerId)
+                  .getMediatorSynchronizerState(decentralizedSynchronizerId)
                   .futureValue
                   .mapping
                   .active
@@ -310,7 +308,7 @@ class SvOffboardingIntegrationTest
             clue("Check sequencer offboarding") {
               val sequencers =
                 sv3Backend.appState.participantAdminConnection
-                  .getSequencerDomainState(decentralizedSynchronizerId)
+                  .getSequencerSynchronizerState(decentralizedSynchronizerId)
                   .futureValue
                   .mapping
                   .active

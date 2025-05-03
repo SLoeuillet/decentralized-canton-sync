@@ -34,16 +34,30 @@ import org.lfdecentralizedtrust.splice.scan.config.{ScanAppBackendConfig, ScanAp
 import org.lfdecentralizedtrust.splice.scan.store.db.ScanAggregator
 import org.lfdecentralizedtrust.splice.util.{
   AmuletConfigSchedule,
+  ChoiceContextWithDisclosures,
   Contract,
   ContractWithState,
+  FactoryChoiceWithDisclosures,
   PackageQualifiedName,
   SpliceUtil,
 }
 import com.digitalasset.canton.console.{BaseInspection, ConsoleCommandResult, Help}
 import com.digitalasset.canton.data.CantonTimestamp
-import com.digitalasset.canton.topology.{DomainId, Member, ParticipantId, PartyId}
+import com.digitalasset.canton.topology.{Member, ParticipantId, PartyId, SynchronizerId}
 import com.google.protobuf.ByteString
+import org.lfdecentralizedtrust.splice.codegen.java.splice.api.token.{
+  allocationinstructionv1,
+  allocationv1,
+  transferinstructionv1,
+}
+import org.lfdecentralizedtrust.tokenstandard.transferinstruction
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.{
+  DsoRules_CloseVoteRequestResult,
+  VoteRequest,
+}
+import org.lfdecentralizedtrust.splice.sv.admin.api.client.commands.HttpSvAdminAppClient
 
+import scala.jdk.OptionConverters.*
 import java.time.Instant
 
 /** Single scan app reference. Defines the console commands that can be run against a client or backend scan
@@ -301,22 +315,22 @@ abstract class ScanAppReference(
     "Get a member's (participant or mediator) traffic status as reported by the sequencer"
   )
   def getMemberTrafficStatus(
-      domainId: DomainId,
+      synchronizerId: SynchronizerId,
       memberId: Member,
   ): definitions.MemberTrafficStatus =
     consoleEnvironment.run {
-      httpCommand(HttpScanAppClient.GetMemberTrafficStatus(domainId, memberId))
+      httpCommand(HttpScanAppClient.GetMemberTrafficStatus(synchronizerId, memberId))
     }
 
   @Help.Summary(
     "Get the id of the participant hosting a given party"
   )
   def getPartyToParticipant(
-      domainId: DomainId,
+      synchronizerId: SynchronizerId,
       partyId: PartyId,
   ): ParticipantId =
     consoleEnvironment.run {
-      httpCommand(HttpScanAppClient.GetPartyToParticipant(domainId, partyId))
+      httpCommand(HttpScanAppClient.GetPartyToParticipant(synchronizerId, partyId))
     }
 
   @Help.Summary(
@@ -475,6 +489,141 @@ abstract class ScanAppReference(
     }
   }
 
+  def getTransferFactory(
+      choiceArgs: transferinstructionv1.TransferFactory_Transfer
+  ): (
+      FactoryChoiceWithDisclosures,
+      transferinstruction.v1.definitions.TransferFactoryWithChoiceContext.TransferKind,
+  ) = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetTransferFactory(choiceArgs))
+    }
+  }
+
+  def getTransferInstructionAcceptContext(
+      transferInstructionId: transferinstructionv1.TransferInstruction.ContractId
+  ): ChoiceContextWithDisclosures = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetTransferInstructionAcceptContext(transferInstructionId))
+    }
+  }
+
+  def getTransferInstructionRejectContext(
+      transferInstructionId: transferinstructionv1.TransferInstruction.ContractId
+  ): ChoiceContextWithDisclosures = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetTransferInstructionRejectContext(transferInstructionId))
+    }
+  }
+
+  def getTransferInstructionWithdrawContext(
+      transferInstructionId: transferinstructionv1.TransferInstruction.ContractId
+  ): ChoiceContextWithDisclosures = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetTransferInstructionWithdrawContext(transferInstructionId))
+    }
+  }
+
+  def getRegistryInfo() =
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetRegistryInfo)
+    }
+
+  def lookupInstrument(instrumentId: String) =
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.LookupInstrument(instrumentId))
+    }
+
+  def listInstruments() =
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.ListInstruments(pageSize = None, pageToken = None))
+    }
+
+  def getAllocationFactory(
+      choiceArgs: allocationinstructionv1.AllocationFactory_Allocate
+  ): FactoryChoiceWithDisclosures = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetAllocationFactory(choiceArgs))
+    }
+  }
+
+  def getAllocationTransferContext(
+      allocationId: allocationv1.Allocation.ContractId
+  ): ChoiceContextWithDisclosures = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetAllocationTransferContext(allocationId))
+    }
+  }
+
+  def getAllocationCancelContext(
+      allocationId: allocationv1.Allocation.ContractId
+  ): ChoiceContextWithDisclosures = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetAllocationCancelContext(allocationId))
+    }
+  }
+
+  def getAllocationWithdrawContext(
+      allocationId: allocationv1.Allocation.ContractId
+  ): ChoiceContextWithDisclosures = {
+    consoleEnvironment.run {
+      httpCommand(HttpScanAppClient.GetAllocationWithdrawContext(allocationId))
+    }
+  }
+
+  @Help.Summary("List vote requests")
+  def listVoteRequests(): Seq[Contract[VoteRequest.ContractId, VoteRequest]] = {
+    consoleEnvironment.run {
+      httpCommand(
+        HttpScanAppClient.ListVoteRequests
+      )
+    }
+  }
+
+  @Help.Summary("Get the latest vote request trackingCid")
+  def getLatestVoteRequestTrackingCid(): VoteRequest.ContractId = {
+    val latestVoteRequest = this
+      .listVoteRequests()
+      .headOption
+      .getOrElse(
+        throw new RuntimeException("No latest vote request found")
+      )
+    latestVoteRequest.payload.trackingCid.toScala.getOrElse(latestVoteRequest.contractId)
+  }
+
+  @Help.Summary("Lookup vote request")
+  def lookupVoteRequest(
+      trackingCid: VoteRequest.ContractId
+  ): Contract[VoteRequest.ContractId, VoteRequest] = {
+    consoleEnvironment.run {
+      httpCommand(
+        HttpSvAdminAppClient.LookupVoteRequest(trackingCid)()
+      )
+    }
+  }
+
+  @Help.Summary("List vote results")
+  def listVoteRequestResults(
+      actionName: Option[String],
+      accepted: Option[Boolean],
+      requester: Option[String],
+      effectiveFrom: Option[String],
+      effectiveTo: Option[String],
+      limit: BigInt,
+  ): Seq[DsoRules_CloseVoteRequestResult] = {
+    consoleEnvironment.run {
+      httpCommand(
+        HttpScanAppClient.ListVoteRequestResults(
+          actionName,
+          accepted,
+          requester,
+          effectiveFrom,
+          effectiveTo,
+          limit,
+        )
+      )
+    }
+  }
 }
 
 final class ScanAppBackendReference(

@@ -74,8 +74,8 @@ import org.lfdecentralizedtrust.splice.sv.util.{
 import org.lfdecentralizedtrust.splice.util.{BackupDump, Contract, HasHealth, TemplateJsonDecoder}
 import com.digitalasset.canton.concurrent.FutureSupervisor
 import com.digitalasset.canton.config.{
-  CommunityCryptoConfig,
-  CommunityCryptoProvider,
+  CryptoConfig,
+  CryptoProvider,
   NonNegativeFiniteDuration,
   ProcessingTimeout,
 }
@@ -84,8 +84,7 @@ import com.digitalasset.canton.lifecycle.{AsyncOrSyncCloseable, FlagCloseableAsy
 import com.digitalasset.canton.logging.{NamedLoggerFactory, TracedLogger}
 import com.digitalasset.canton.resource.Storage
 import com.digitalasset.canton.time.Clock
-import com.digitalasset.canton.time.EnrichedDurations.*
-import com.digitalasset.canton.topology.{DomainId, ParticipantId, PartyId}
+import com.digitalasset.canton.topology.{ParticipantId, PartyId, SynchronizerId}
 import com.digitalasset.canton.tracing.{TraceContext, TracerProvider}
 import com.digitalasset.canton.version.ProtocolVersion
 import io.circe.Json
@@ -99,6 +98,8 @@ import org.apache.pekko.http.scaladsl.model.HttpMethods
 import org.apache.pekko.http.scaladsl.server.Directives.*
 
 import java.nio.file.Paths
+import java.time.Instant
+import java.util.Optional
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutor, Future, blocking}
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
@@ -133,8 +134,8 @@ class SvApp(
   private val cometBftConfig = config.cometBftConfig
     .filter(_.enabled)
 
-  override def packages: Seq[DarResource] =
-    super.packages ++ DarResources.dsoGovernance.all ++ DarResources.validatorLifecycle.all ++ DarResources.amuletNameService.all
+  override def packagesForJsonDecoding: Seq[DarResource] =
+    super.packagesForJsonDecoding ++ DarResources.dsoGovernance.all ++ DarResources.validatorLifecycle.all ++ DarResources.amuletNameService.all
 
   override def preInitializeBeforeLedgerConnection()(implicit tc: TraceContext): Future[Unit] = {
     val participantAdminConnection = new ParticipantAdminConnection(
@@ -195,43 +196,48 @@ class SvApp(
     )
 
     val localSynchronizerNode = config.localSynchronizerNode
-      .map(config =>
+      .map(svSynchronizerConfig =>
         new LocalSynchronizerNode(
           participantAdminConnection,
           new SequencerAdminConnection(
-            config.sequencer.adminApi,
+            svSynchronizerConfig.sequencer.adminApi,
             amuletAppParameters.loggingConfig.api,
             loggerFactory,
             metrics.grpcClientMetrics,
             retryProvider,
           ),
           new MediatorAdminConnection(
-            config.mediator.adminApi,
+            svSynchronizerConfig.mediator.adminApi,
             amuletAppParameters.loggingConfig.api,
             loggerFactory,
             metrics.grpcClientMetrics,
             retryProvider,
           ),
-          config.parameters
-            .toStaticDomainParameters(
-              CommunityCryptoConfig(provider = CommunityCryptoProvider.Jce),
-              ProtocolVersion.v32,
+          svSynchronizerConfig.parameters
+            .toStaticSynchronizerParameters(
+              CryptoConfig(provider = CryptoProvider.Jce),
+              ProtocolVersion.v33,
             )
             .valueOr(err =>
               throw new IllegalArgumentException(s"Invalid domain parameters config: $err")
             ),
-          config.sequencer.internalApi,
-          config.sequencer.externalPublicApiUrl,
-          config.sequencer.sequencerAvailabilityDelay.asJava,
-          config.sequencer.pruning,
-          config.mediator.sequencerRequestAmplification,
+          svSynchronizerConfig.sequencer.internalApi,
+          svSynchronizerConfig.sequencer.externalPublicApiUrl,
+          svSynchronizerConfig.sequencer.sequencerAvailabilityDelay.asJava,
+          svSynchronizerConfig.sequencer.pruning,
+          svSynchronizerConfig.mediator.sequencerRequestAmplification,
           loggerFactory,
           retryProvider,
+          SequencerConfig.fromConfig(
+            svSynchronizerConfig.sequencer,
+            cometBftConfig,
+          ),
         )
       )
     val extraSynchronizerNodes = config.synchronizerNodes.view.mapValues { c =>
       ExtraSynchronizerNode.fromConfig(
         c,
+        config.cometBftConfig,
         amuletAppParameters.loggingConfig.api,
         loggerFactory,
         metrics.grpcClientMetrics,
@@ -297,7 +303,6 @@ class SvApp(
           extraSynchronizerNodes,
           joiningConfig,
           participantId,
-          Seq.empty, // A joining SV does not initially upload any DARs, they will be vetted by PackageVettingTrigger instead
           config,
           amuletAppParameters.upgradesConfig,
           cometBftNode,
@@ -426,6 +431,12 @@ class SvApp(
             }
           } yield res
       }
+      packageVersionSupport = PackageVersionSupport.createPackageVersionSupport(
+        config.parameters.enableCantonPackageSelection,
+        dsoStore,
+        decentralizedSynchronizer,
+        svAutomation.connection,
+      )
 
       (_, _, isDevNet, _, _, _, _) <- (
         // We create the validator user only after the DSO party migration and DAR uploads have completed. This avoids two issues:
@@ -434,7 +445,14 @@ class SvApp(
         //    but could also be imported through the stream of the SV party. By only creating the validator user here
         //    we ensure that the party migration has been completed before the contract is created.
         appInitStep("Initialize validator") {
-          SvApp.initializeValidator(dsoAutomation, config, retryProvider, logger, clock)
+          SvApp.initializeValidator(
+            dsoAutomation,
+            config,
+            retryProvider,
+            logger,
+            clock,
+            packageVersionSupport,
+          )
         },
         // Ensure Daml-level invariants for the SV
         // ----------------------------------------
@@ -528,11 +546,14 @@ class SvApp(
         ),
         cometBftClient,
         loggerFactory,
+        config.localSynchronizerNode.exists(_.sequencer.isBftSequencer),
+        packageVersionSupport,
       )
 
       adminHandler = new HttpSvAdminHandler(
         config,
         config.domainMigrationDumpPath,
+        amuletAppParameters.upgradesConfig,
         svAutomation,
         dsoAutomation,
         cometBftClient,
@@ -554,6 +575,8 @@ class SvApp(
         ),
         clock,
         retryProvider,
+        packageVersionSupport,
+        timeouts,
         loggerFactory,
       )
 
@@ -570,6 +593,7 @@ class SvApp(
               retryProvider,
               loggerFactory,
               amuletAppParameters,
+              packageVersionSupport,
             )
           )
         else Seq.empty
@@ -640,6 +664,7 @@ class SvApp(
         dsoStore,
         svAutomation,
         dsoAutomation,
+        adminHandler,
         logger,
         timeouts,
         httpClient,
@@ -715,7 +740,7 @@ class SvApp(
 
   private def expectConfiguredValidatorOnboardings(
       svStoreWithIngestion: AppStoreWithIngestion[SvSvStore],
-      decentralizedSynchronizer: DomainId,
+      decentralizedSynchronizer: SynchronizerId,
       clock: Clock,
   )(implicit tc: TraceContext): Future[List[Unit]] = {
     if (
@@ -781,6 +806,7 @@ object SvApp {
       dsoStore: SvDsoStore,
       svAutomation: SvSvAutomationService,
       dsoAutomation: SvDsoAutomationService,
+      svAdminHandler: HttpSvAdminHandler,
       logger: TracedLogger,
       timeouts: ProcessingTimeout,
       httpClient: HttpClient,
@@ -810,6 +836,7 @@ object SvApp {
         SyncCloseable("dso store", dsoStore.close()),
         SyncCloseable("domain time automation", domainTimeAutomationService.close()),
         SyncCloseable("domain params automation", domainParamsAutomationService.close()),
+        SyncCloseable("admin handler", svAdminHandler.close()),
         SyncCloseable("storage", storage.close()),
       )
   }
@@ -819,7 +846,7 @@ object SvApp {
       secret: ValidatorOnboardingSecret,
       expiresIn: NonNegativeFiniteDuration,
       svStoreWithIngestion: AppStoreWithIngestion[SvSvStore],
-      decentralizedSynchronizer: DomainId,
+      decentralizedSynchronizer: SynchronizerId,
       clock: Clock,
       logger: TracedLogger,
       retryProvider: RetryProvider,
@@ -860,7 +887,7 @@ object SvApp {
                         ),
                       deduplicationOffset = offset,
                     )
-                    .withDomainId(domainId = decentralizedSynchronizer)
+                    .withSynchronizerId(synchronizerId = decentralizedSynchronizer)
                     .yieldUnit(),
                   logger,
                 )
@@ -987,6 +1014,7 @@ object SvApp {
       reasonUrl: String,
       reasonDescription: String,
       expiration: Json,
+      effectiveTime: Optional[Instant],
       dsoStoreWithIngestion: AppStoreWithIngestion[SvDsoStore],
   )(implicit
       ec: ExecutionContext,
@@ -1021,6 +1049,7 @@ object SvApp {
               decodedAction,
               reason,
               java.util.Optional.of(decodedExpiration),
+              effectiveTime,
             )
             cmd = dsoRules.exercise(_.exerciseDsoRules_RequestVote(request))
             _ <- dsoStoreWithIngestion.connection
@@ -1217,6 +1246,7 @@ object SvApp {
       retryProvider: RetryProvider,
       logger: TracedLogger,
       clock: Clock,
+      packageVersionSupport: PackageVersionSupport,
   )(implicit ec: ExecutionContext, tc: TraceContext): Future[Unit] = {
     val store = dsoStoreWithIngestion.store
     val svParty = store.key.svParty
@@ -1237,35 +1267,37 @@ object SvApp {
               Future.unit
             case QueryResult(offset, None) =>
               logger.debug("Trying to create validator license for SV party")
+              val dsoParty = store.key.dsoParty
               for {
-                amuletRules <- store.getAmuletRules().map(_.payload)
-                now = clock.now
-                supportsValidatorLicenseMetadata = PackageIdResolver
+                validatorLicenseMetadataFeatureSupport <- packageVersionSupport
                   .supportsValidatorLicenseMetadata(
-                    now,
-                    amuletRules,
+                    Seq(dsoParty, svParty),
+                    clock.now,
                   )
                 cmd = dsoRules.exercise(
                   _.exerciseDsoRules_OnboardValidator(
                     svParty.toProtoPrimitive,
                     svParty.toProtoPrimitive,
                     Some(BuildInfo.compiledVersion)
-                      .filter(_ => supportsValidatorLicenseMetadata)
+                      .filter(_ => validatorLicenseMetadataFeatureSupport.supported)
                       .toJava,
-                    Some(config.contactPoint).filter(_ => supportsValidatorLicenseMetadata).toJava,
+                    Some(config.contactPoint)
+                      .filter(_ => validatorLicenseMetadataFeatureSupport.supported)
+                      .toJava,
                   )
                 )
                 _ <- dsoStoreWithIngestion.connection
                   .submit(
                     actAs = Seq(svParty),
-                    readAs = Seq(store.key.dsoParty),
+                    readAs = Seq(dsoParty),
                     cmd,
                   )
+                  .withPrefferedPackage(validatorLicenseMetadataFeatureSupport.packageIds)
                   .withDedup(
                     commandId = SpliceLedgerConnection.CommandId(
                       "org.lfdecentralizedtrust.splice.sv.createSvValidatorLicense",
                       Seq(
-                        store.key.dsoParty,
+                        dsoParty,
                         svParty,
                       ),
                       svParty.toProtoPrimitive,

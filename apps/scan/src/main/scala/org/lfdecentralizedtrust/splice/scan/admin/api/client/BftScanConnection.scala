@@ -11,6 +11,7 @@ import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletrules.{
   AmuletRules,
   TransferPreapproval,
 }
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.DsoRules
 import org.lfdecentralizedtrust.splice.codegen.java.splice.externalpartyamuletrules.{
   ExternalPartyAmuletRules,
   TransferCommandCounter,
@@ -22,7 +23,6 @@ import org.lfdecentralizedtrust.splice.codegen.java.splice.round.{
 import org.lfdecentralizedtrust.splice.codegen.java.splice.ans.AnsRules
 import org.lfdecentralizedtrust.splice.config.{NetworkAppClientConfig, UpgradesConfig}
 import org.lfdecentralizedtrust.splice.environment.PackageIdResolver.HasAmuletRules
-import org.lfdecentralizedtrust.splice.environment.ledger.api.LedgerClient
 import org.lfdecentralizedtrust.splice.environment.{
   BaseAppConnection,
   RetryFor,
@@ -47,10 +47,16 @@ import org.lfdecentralizedtrust.splice.scan.admin.api.client.commands.HttpScanAp
 import org.lfdecentralizedtrust.splice.scan.config.ScanAppClientConfig
 import org.lfdecentralizedtrust.splice.scan.store.ScanStore
 import org.lfdecentralizedtrust.splice.store.HistoryBackfilling.SourceMigrationInfo
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.UpdateHistoryResponse
 import org.lfdecentralizedtrust.splice.util.{Contract, ContractWithState, TemplateJsonDecoder}
 import com.digitalasset.canton.config.NonNegativeFiniteDuration
 import com.digitalasset.canton.data.CantonTimestamp
-import com.digitalasset.canton.lifecycle.{AsyncOrSyncCloseable, FlagCloseableAsync, SyncCloseable}
+import com.digitalasset.canton.lifecycle.{
+  AsyncOrSyncCloseable,
+  FlagCloseableAsync,
+  FutureUnlessShutdown,
+  SyncCloseable,
+}
 import com.digitalasset.canton.logging.{
   ErrorLoggingContext,
   NamedLoggerFactory,
@@ -58,7 +64,7 @@ import com.digitalasset.canton.logging.{
   TracedLogger,
 }
 import com.digitalasset.canton.time.{Clock, PeriodicAction}
-import com.digitalasset.canton.topology.{DomainId, PartyId}
+import com.digitalasset.canton.topology.{PartyId, SynchronizerId}
 import com.digitalasset.canton.tracing.TraceContext
 import com.digitalasset.canton.util.LoggerUtil
 import com.digitalasset.canton.util.retry.{ErrorKind, ExceptionRetryPolicy}
@@ -68,6 +74,10 @@ import org.apache.pekko.http.scaladsl.model.*
 import org.apache.pekko.http.scaladsl.unmarshalling.Unmarshal
 import org.apache.pekko.stream.Materializer
 import org.apache.pekko.util.ByteString
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.{
+  DsoRules_CloseVoteRequestResult,
+  VoteRequest,
+}
 import org.slf4j.event.Level
 
 import java.util.concurrent.ConcurrentHashMap
@@ -106,24 +116,34 @@ class BftScanConnection(
           "refresh_scan_list",
         )({ tc =>
           // This retry makes sure any partial or complete failures are immediately retried with a backoff.
-          retryProvider.retry(
-            RetryFor.LongRunningAutomation,
-            "refresh_scan_list",
-            "refresh_scan_list",
-            bft.refresh(this)(tc).flatMap { connections =>
-              if (connections.failed > 0)
-                Future.failed(
-                  io.grpc.Status.UNAVAILABLE
-                    .withDescription("Deliberately enforcing a retry on failed scans.")
-                    .asRuntimeException()
-                )
-              else Future.unit
-            },
-            logger,
-          )(implicitly, TraceContext.empty, implicitly)
+          FutureUnlessShutdown.outcomeF(
+            retryProvider.retry(
+              RetryFor.LongRunningAutomation,
+              "refresh_scan_list",
+              "refresh_scan_list",
+              bft.refresh(this)(tc).flatMap { connections =>
+                if (connections.failed > 0)
+                  Future.failed(
+                    io.grpc.Status.UNAVAILABLE
+                      .withDescription("Deliberately enforcing a retry on failed scans.")
+                      .asRuntimeException()
+                  )
+                else Future.unit
+              },
+              logger,
+            )(implicitly, TraceContext.empty, implicitly)
+          )
         })
       )
   }
+
+  override def listVoteRequests()(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[Seq[Contract[VoteRequest.ContractId, VoteRequest]]] =
+    bftCall(
+      _.listVoteRequests()
+    )
 
   override def getDsoPartyId()(implicit ec: ExecutionContext, tc: TraceContext): Future[PartyId] =
     bftCall(
@@ -136,6 +156,12 @@ class BftScanConnection(
     bftCall(
       _.getAmuletRulesWithState(cachedAmuletRules)
     )
+
+  override def getDsoRules(
+  )(implicit
+      tc: TraceContext
+  ): Future[Contract[DsoRules.ContractId, DsoRules]] =
+    bftCall(_.getDsoRules())
 
   override protected def runGetExternalPartyAmuletRules(
       cachedExternalPartyAmuletRules: Option[
@@ -310,13 +336,55 @@ class BftScanConnection(
   ): Future[Option[ContractWithState[TransferPreapproval.ContractId, TransferPreapproval]]] =
     bftCall(_.lookupTransferPreapprovalByParty(receiver))
 
+  override def listDsoRulesVoteRequests()(implicit
+      tc: TraceContext,
+      ec: ExecutionContext,
+  ): Future[Seq[Contract[VoteRequest.ContractId, VoteRequest]]] =
+    bftCall(_.listDsoRulesVoteRequests())
+
+  override def listVoteRequestsByTrackingCid(
+      voteRequestCids: Seq[VoteRequest.ContractId]
+  )(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[
+    Seq[Contract[VoteRequest.ContractId, VoteRequest]]
+  ] = bftCall(_.listVoteRequestsByTrackingCid(voteRequestCids))
+
+  def lookupVoteRequest(contractId: VoteRequest.ContractId)(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[Option[Contract[VoteRequest.ContractId, VoteRequest]]] =
+    bftCall(_.lookupVoteRequest(contractId))
+
+  override def listVoteRequestResults(
+      actionName: Option[String],
+      accepted: Option[Boolean],
+      requester: Option[String],
+      effectiveFrom: Option[String],
+      effectiveTo: Option[String],
+      limit: Int,
+  )(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[Seq[DsoRules_CloseVoteRequestResult]] = bftCall(
+    _.listVoteRequestResults(
+      actionName,
+      accepted,
+      requester,
+      effectiveFrom,
+      effectiveTo,
+      limit,
+    )
+  )
+
   override def getUpdatesBefore(
       migrationId: Long,
-      domainId: DomainId,
+      synchronizerId: SynchronizerId,
       before: CantonTimestamp,
       atOrAfter: Option[CantonTimestamp],
       count: Int,
-  )(implicit tc: TraceContext): Future[Seq[LedgerClient.GetTreeUpdatesResponse]] = {
+  )(implicit tc: TraceContext): Future[Seq[UpdateHistoryResponse]] = {
     require(atOrAfter.isEmpty, "atOrAfter is chosen by BftScanConnection")
     val connections = scanList.scanConnections
     for {
@@ -324,16 +392,17 @@ class BftScanConnection(
       responses <- getMigrationInfoResponses(connections, migrationId)
       // Filter out connections that don't have any data
       withData = responses.withData.toList.filter { case (_, info) =>
-        info.recordTimeRange.get(domainId).exists(_.min < before)
+        info.recordTimeRange.get(synchronizerId).exists(_.min < before)
       }
       connectionsWithData = withData.map(_._1)
       // Find the record time range for which all remaining connections have the data
       atOrAfter = withData.flatMap { case (_, info) =>
-        info.recordTimeRange.get(domainId).map(_.min)
+        info.recordTimeRange.get(synchronizerId).map(_.min)
       }.maxOption
       // Make a BFT call to connections that have the data
       result <- bftCall(
-        connection => connection.getUpdatesBefore(migrationId, domainId, before, atOrAfter, count),
+        connection =>
+          connection.getUpdatesBefore(migrationId, synchronizerId, before, atOrAfter, count),
         BftCallConfig.forAvailableData(connections, connectionsWithData.contains),
         // This method is very sensitive to unavailable SVs.
         // Do not log warnings for failures to reach consensus, as this would be too noisy,
@@ -344,7 +413,7 @@ class BftScanConnection(
         // scans return different updates. In the more unlikely case where scans disagree on the payload of
         // a given update, we would need to fetch the update payload from the update history database.
         shortenResponsesForLog =
-          (responses: Seq[LedgerClient.GetTreeUpdatesResponse]) => responses.map(_.update.updateId),
+          (responses: Seq[UpdateHistoryResponse]) => responses.map(_.update.updateId),
       )
     } yield {
       result
@@ -734,7 +803,7 @@ object BftScanConnection {
         decentralizedSynchronizerId <- connection.getAmuletRulesDomain()(tc)
         scans <- connection.listDsoScans()
         domainScans <- scans
-          .find(_.domainId == decentralizedSynchronizerId)
+          .find(_.synchronizerId == decentralizedSynchronizerId)
           .map(e => Future.successful(e.scans))
           .getOrElse(
             Future.failed(
@@ -945,21 +1014,28 @@ object BftScanConnection {
           retryConnectionOnInitialFailure = false,
         )
 
-  sealed trait BftScanClientConfig
+  sealed trait BftScanClientConfig {
+    def setAmuletRulesCacheTimeToLive(ttl: NonNegativeFiniteDuration): BftScanClientConfig
+  }
   object BftScanClientConfig {
     case class TrustSingle(
         url: Uri,
         amuletRulesCacheTimeToLive: NonNegativeFiniteDuration =
           ScanAppClientConfig.DefaultAmuletRulesCacheTimeToLive,
-    ) extends BftScanClientConfig
+    ) extends BftScanClientConfig {
+      def setAmuletRulesCacheTimeToLive(ttl: NonNegativeFiniteDuration): TrustSingle =
+        copy(amuletRulesCacheTimeToLive = ttl)
+    }
     case class Bft(
         seedUrls: NonEmptyList[Uri],
         scansRefreshInterval: NonNegativeFiniteDuration =
           ScanAppClientConfig.DefaultScansRefreshInterval,
         amuletRulesCacheTimeToLive: NonNegativeFiniteDuration =
           ScanAppClientConfig.DefaultAmuletRulesCacheTimeToLive,
-    ) extends BftScanClientConfig
-
+    ) extends BftScanClientConfig {
+      def setAmuletRulesCacheTimeToLive(ttl: NonNegativeFiniteDuration): Bft =
+        copy(amuletRulesCacheTimeToLive = ttl)
+    }
   }
 
   private sealed trait ScanResponse[+T]

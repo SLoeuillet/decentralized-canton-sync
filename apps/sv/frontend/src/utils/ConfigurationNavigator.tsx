@@ -1,6 +1,10 @@
 // Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-import { JSONValue, JsonEditor, getUTCWithOffset } from 'common-frontend-utils';
+import {
+  JSONValue,
+  JsonEditor,
+  getUTCWithOffset,
+} from '@lfdecentralizedtrust/splice-common-frontend-utils';
 import { Dayjs } from 'dayjs';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
@@ -9,7 +13,7 @@ import React, { useState } from 'react';
 import { Box, Button, Card, CardContent, CardHeader, Stack, Typography } from '@mui/material';
 import { DesktopDateTimePicker } from '@mui/x-date-pickers/DesktopDateTimePicker';
 
-import { Tuple2 } from '@daml.js/5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4/lib/DA/Types';
+import { Tuple2 } from '@daml.js/daml-prim-DA-Types-1.0.0/lib/DA/Types/module';
 import { AmuletConfig, USD } from '@daml.js/splice-amulet/lib/Splice/AmuletConfig';
 import { Schedule } from '@daml.js/splice-amulet/lib/Splice/Schedule';
 

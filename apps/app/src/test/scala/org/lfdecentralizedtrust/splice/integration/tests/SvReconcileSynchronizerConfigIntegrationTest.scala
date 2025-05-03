@@ -2,18 +2,16 @@ package org.lfdecentralizedtrust.splice.integration.tests
 
 import org.lfdecentralizedtrust.splice.codegen.java.da.time.types.RelTime
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletconfig.{AmuletConfig, USD}
-import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletrules.AmuletRules_AddFutureAmuletConfigSchedule
-import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.actionrequiringconfirmation.ARC_AmuletRules
-import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.amuletrules_actionrequiringconfirmation.CRARC_AddFutureAmuletConfigSchedule
+import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletrules.AmuletRules_SetConfig
 import org.lfdecentralizedtrust.splice.codegen.java.splice.decentralizedsynchronizer.{
   AmuletDecentralizedSynchronizerConfig,
   BaseRateTrafficLimits,
   SynchronizerFeesConfig,
 }
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.actionrequiringconfirmation.ARC_AmuletRules
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.amuletrules_actionrequiringconfirmation.CRARC_SetConfig
 import org.lfdecentralizedtrust.splice.util.AmuletConfigSchedule
 
-import java.time.Instant
-import java.time.temporal.ChronoUnit
 import scala.concurrent.duration.*
 
 class SvReconcileSynchronizerConfigIntegrationTest extends SvIntegrationTestBase {
@@ -22,8 +20,8 @@ class SvReconcileSynchronizerConfigIntegrationTest extends SvIntegrationTestBase
     initDso()
 
     val decentralizedSynchronizerId =
-      inside(sv1Backend.participantClient.domains.list_connected()) { case Seq(domain) =>
-        domain.domainId
+      inside(sv1Backend.participantClient.synchronizers.list_connected()) { case Seq(domain) =>
+        domain.synchronizerId
       }
 
     val amuletConfig: AmuletConfig[USD] =
@@ -32,9 +30,9 @@ class SvReconcileSynchronizerConfigIntegrationTest extends SvIntegrationTestBase
     clue("domain parameter is initialized") {
       eventually() {
         val trafficControlParameters =
-          sv1Backend.participantClientWithAdminToken.topology.domain_parameters
-            .get_dynamic_domain_parameters(decentralizedSynchronizerId)
-            .trafficControlParameters
+          sv1Backend.participantClientWithAdminToken.topology.synchronizer_parameters
+            .get_dynamic_synchronizer_parameters(decentralizedSynchronizerId)
+            .trafficControl
             .value
         trafficControlParameters.maxBaseTrafficAmount.value shouldBe
           amuletConfig.decentralizedSynchronizer.fees.baseRateTrafficLimits.burstAmount
@@ -54,12 +52,10 @@ class SvReconcileSynchronizerConfigIntegrationTest extends SvIntegrationTestBase
       amuletConfig.decentralizedSynchronizer.fees.readVsWriteScalingFactor + 1,
     )
     val configChangeAction = new ARC_AmuletRules(
-      new CRARC_AddFutureAmuletConfigSchedule(
-        new AmuletRules_AddFutureAmuletConfigSchedule(
-          new org.lfdecentralizedtrust.splice.codegen.java.da.types.Tuple2(
-            Instant.now().plus(20, ChronoUnit.SECONDS),
-            newAmuletConfig,
-          )
+      new CRARC_SetConfig(
+        new AmuletRules_SetConfig(
+          newAmuletConfig,
+          amuletConfig,
         )
       )
     )
@@ -74,12 +70,13 @@ class SvReconcileSynchronizerConfigIntegrationTest extends SvIntegrationTestBase
               "url",
               "description",
               sv1Backend.getDsoInfo().dsoRules.payload.config.voteRequestTimeout,
+              None,
             )
           },
         )("vote request has been created", _ => sv1Backend.listVoteRequests().loneElement)
 
-        clue(s"sv2-4 accept") {
-          Seq(sv2Backend, sv3Backend, sv4Backend).map(sv =>
+        clue(s"sv2 and sv3 accept") {
+          Seq(sv2Backend, sv3Backend).map(sv =>
             eventuallySucceeds() {
               sv.castVote(
                 voteRequest.contractId,
@@ -110,9 +107,9 @@ class SvReconcileSynchronizerConfigIntegrationTest extends SvIntegrationTestBase
     clue("domain parameter is reconciled") {
       eventually() {
         val trafficControlParameters =
-          sv1Backend.participantClientWithAdminToken.topology.domain_parameters
-            .get_dynamic_domain_parameters(decentralizedSynchronizerId)
-            .trafficControlParameters
+          sv1Backend.participantClientWithAdminToken.topology.synchronizer_parameters
+            .get_dynamic_synchronizer_parameters(decentralizedSynchronizerId)
+            .trafficControl
             .value
         trafficControlParameters.maxBaseTrafficAmount.value shouldBe
           amuletConfig.decentralizedSynchronizer.fees.baseRateTrafficLimits.burstAmount + 1
@@ -147,6 +144,7 @@ class SvReconcileSynchronizerConfigIntegrationTest extends SvIntegrationTestBase
     ),
     amuletConfig.tickDuration,
     amuletConfig.packageConfig,
+    java.util.Optional.empty(),
     java.util.Optional.empty(),
   )
 

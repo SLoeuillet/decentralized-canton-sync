@@ -13,6 +13,7 @@ import org.lfdecentralizedtrust.splice.util.WalletTestUtil
 
 import scala.jdk.CollectionConverters.*
 
+//TODO(#16139): remove this test
 class SvTimeBasedPruneAmuletConfigScheduleIntegrationTest
     extends IntegrationTestWithSharedEnvironment
     with SvTimeBasedIntegrationTestUtil
@@ -35,6 +36,7 @@ class SvTimeBasedPruneAmuletConfigScheduleIntegrationTest
           new RelTime(java.time.Duration.ofMinutes(1).toMillis * 1000L),
           amuletConfig.packageConfig,
           java.util.Optional.empty(),
+          java.util.Optional.empty(),
         )
       val scheduledTime = getLedgerTime.plus(java.time.Duration.ofMinutes(1)).toInstant
       val configChangeAction = new ARC_AmuletRules(
@@ -55,6 +57,7 @@ class SvTimeBasedPruneAmuletConfigScheduleIntegrationTest
           "url",
           "description",
           sv1Backend.getDsoInfo().dsoRules.payload.config.voteRequestTimeout,
+          None,
         ),
       )(
         "schedule is updated",

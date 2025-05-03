@@ -151,9 +151,18 @@ spec:
                 canton.sv-apps.sv.domain-migration-dump-path = "/domain-upgrade-dump/domain_migration_dump.json"
             {{- with .Values.domain }}
             - name: ADDITIONAL_CONFIG_SV_DOMAIN
+              #TODO(#15343) - switch to port 443 https://github.com/DACH-NY/canton/issues/23835
               value: |
                 canton.sv-apps.sv.local-synchronizer-node {
                   sequencer {
+                    {{- if .enableBftSequencer }}
+                    is-bft-sequencer = true
+                    external-peer-api-url-suffix =  {
+                      address = {{ .sequencerBftPublicUrlSuffix | quote }}
+                      port = 443
+                      tls-config.enabled = true
+                    }
+                    {{- end }}
                     admin-api {
                       address = {{ .sequencerAddress | quote }}
                       port = 5009
@@ -189,6 +198,28 @@ spec:
             {{- if (.Values.cometBFT).connectionUri }}
             - name: SPLICE_APP_SV_COMETBFT_CONNECTION_URI
               value: {{ (.Values.cometBFT).connectionUri }}
+            {{- end }}
+            {{- if (.Values.cometBFT).externalGovernanceKey }}
+            - name: ADDITIONAL_CONFIG_SV_COMETBFT_GOVERNANCE_KEY
+              value: |
+                _comet_bft_config {
+                  governance-key {
+                    public-key = ${?SPLICE_APP_SV_COMETBFT_GOVERNANCE_PUBLIC_KEY}
+                    private-key = ${?SPLICE_APP_SV_COMETBFT_GOVERNANCE_PRIVATE_KEY}
+                  }
+                }
+            - name: SPLICE_APP_SV_COMETBFT_GOVERNANCE_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: public
+                  name: "splice-app-sv-cometbft-governance-key"
+                  optional: false
+            - name: SPLICE_APP_SV_COMETBFT_GOVERNANCE_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: private
+                  name: "splice-app-sv-cometbft-governance-key"
+                  optional: false
             {{- end }}
             - name: SPLICE_APP_UI_NETWORK_NAME
               value: {{ .Values.spliceInstanceNames.networkName | quote }}

@@ -11,6 +11,7 @@ import com.digitalasset.canton.concurrent.FutureSupervisor
 import com.digitalasset.canton.lifecycle.CloseContext
 import com.digitalasset.canton.resource.DbStorage
 import com.digitalasset.canton.topology.ParticipantId
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.BackfillingRequirement
 
 import scala.concurrent.ExecutionContext
 
@@ -18,10 +19,12 @@ abstract class DbTxLogAppStore[TXE](
     storage: DbStorage,
     acsTableName: String,
     txLogTableName: String,
-    storeDescriptor: DbMultiDomainAcsStore.StoreDescriptor,
+    acsStoreDescriptor: DbMultiDomainAcsStore.StoreDescriptor,
+    txLogStoreDescriptor: DbMultiDomainAcsStore.StoreDescriptor,
     domainMigrationInfo: DomainMigrationInfo,
     participantId: ParticipantId,
     enableissue12777Workaround: Boolean,
+    backfillingRequired: BackfillingRequirement,
     oHistoryMetrics: Option[HistoryMetrics] = None,
 )(implicit
     override protected val ec: ExecutionContext,
@@ -30,10 +33,11 @@ abstract class DbTxLogAppStore[TXE](
 ) extends DbAppStore(
       storage = storage,
       acsTableName = acsTableName,
-      storeDescriptor = storeDescriptor,
+      acsStoreDescriptor = acsStoreDescriptor,
       domainMigrationInfo = domainMigrationInfo,
       participantId = participantId,
       enableissue12777Workaround = enableissue12777Workaround,
+      backfillingRequired,
       oHistoryMetrics = oHistoryMetrics,
     )
     with TxLogAppStore[TXE] {
@@ -43,7 +47,8 @@ abstract class DbTxLogAppStore[TXE](
       storage,
       acsTableName,
       Some(txLogTableName),
-      storeDescriptor,
+      acsStoreDescriptor,
+      Some(txLogStoreDescriptor),
       loggerFactory,
       acsContractFilter,
       txLogConfig,
@@ -57,10 +62,11 @@ abstract class DbTxLogAppStore[TXE](
 abstract class DbAppStore(
     storage: DbStorage,
     acsTableName: String,
-    storeDescriptor: DbMultiDomainAcsStore.StoreDescriptor,
+    acsStoreDescriptor: DbMultiDomainAcsStore.StoreDescriptor,
     domainMigrationInfo: DomainMigrationInfo,
     participantId: ParticipantId,
     enableissue12777Workaround: Boolean,
+    backfillingRequired: BackfillingRequirement,
     oHistoryMetrics: Option[HistoryMetrics] = None,
 )(implicit
     protected val ec: ExecutionContext,
@@ -78,7 +84,8 @@ abstract class DbAppStore(
       storage,
       acsTableName,
       None,
-      storeDescriptor,
+      acsStoreDescriptor,
+      None,
       loggerFactory,
       acsContractFilter,
       TxLogStore.Config.empty,
@@ -88,8 +95,8 @@ abstract class DbAppStore(
       handleIngestionSummary,
     )
 
-  override lazy val domains: InMemoryDomainStore =
-    new InMemoryDomainStore(
+  override lazy val domains: InMemorySynchronizerStore =
+    new InMemorySynchronizerStore(
       acsContractFilter.ingestionFilter.primaryParty,
       loggerFactory,
       retryProvider,
@@ -99,9 +106,10 @@ abstract class DbAppStore(
     new UpdateHistory(
       storage,
       domainMigrationInfo,
-      storeDescriptor.name,
+      acsStoreDescriptor.name,
       participantId,
       acsContractFilter.ingestionFilter.primaryParty,
+      backfillingRequired,
       loggerFactory,
       enableissue12777Workaround,
       oHistoryMetrics,

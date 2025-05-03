@@ -59,11 +59,11 @@ class ExternalPartySetupProposalIntegrationTest
     with TriggerTestUtil
     with ExternallySignedPartyTestUtil {
 
-  override lazy val updateHistoryIgnoredRootExercises = Seq(
+  override lazy val sanityChecksIgnoredRootExercises = Seq(
     (TransferPreapproval.TEMPLATE_ID_WITH_PACKAGE_ID, "Archive")
   )
 
-  override lazy val updateHistoryIgnoredRootCreates = Seq(
+  override lazy val sanityChecksIgnoredRootCreates = Seq(
     TransferPreapproval.TEMPLATE_ID_WITH_PACKAGE_ID,
     amuletCodegen.AppRewardCoupon.TEMPLATE_ID_WITH_PACKAGE_ID,
   )
@@ -226,6 +226,7 @@ class ExternalPartySetupProposalIntegrationTest
           false,
           appRewardAmount.bigDecimal,
           issuingRound.round,
+          java.util.Optional.empty(),
         ).create,
       ),
     )(
@@ -259,11 +260,13 @@ class ExternalPartySetupProposalIntegrationTest
             .signBytes(
               HexString.parseToByteString(prepareSend.txHash).value,
               alicePrivateKey.asInstanceOf[SigningPrivateKey],
+              usage = SigningKeyUsage.ProtocolOnly,
             )
             .value
+            .toProtoV30
             .signature
         ),
-        HexString.toHexString(alicePublicKey.key),
+        publicKeyAsHexString(alicePublicKey),
       ),
     )(
       "validator automation completes transfer",
@@ -433,11 +436,13 @@ class ExternalPartySetupProposalIntegrationTest
               .signBytes(
                 HexString.parseToByteString(prepareSendNoPreapproval.txHash).value,
                 alicePrivateKey.asInstanceOf[SigningPrivateKey],
+                usage = SigningKeyUsage.ProtocolOnly,
               )
               .value
+              .toProtoV30
               .signature
           ),
-          HexString.toHexString(alicePublicKey.key),
+          publicKeyAsHexString(alicePublicKey),
         ),
       )(
         "TransferCommand is created",

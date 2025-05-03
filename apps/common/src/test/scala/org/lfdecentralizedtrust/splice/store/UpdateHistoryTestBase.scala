@@ -2,10 +2,8 @@ package org.lfdecentralizedtrust.splice.store
 
 import com.daml.ledger.api.v2.TraceContextOuterClass
 import com.daml.ledger.javaapi.data.{CreatedEvent, ExercisedEvent, TransactionTree, TreeEvent}
-import org.lfdecentralizedtrust.splice.environment.ledger.api.LedgerClient.GetTreeUpdatesResponse
 import org.lfdecentralizedtrust.splice.environment.ledger.api.ReassignmentEvent.{Assign, Unassign}
 import org.lfdecentralizedtrust.splice.environment.ledger.api.{
-  LedgerClient,
   Reassignment,
   ReassignmentEvent,
   ReassignmentUpdate,
@@ -14,15 +12,20 @@ import org.lfdecentralizedtrust.splice.environment.ledger.api.{
 import org.lfdecentralizedtrust.splice.migration.DomainMigrationInfo
 import org.lfdecentralizedtrust.splice.store.db.{AcsJdbcTypes, AcsTables, SplicePostgresTest}
 import com.digitalasset.canton.data.CantonTimestamp
+import com.digitalasset.canton.lifecycle.FutureUnlessShutdown
 import com.digitalasset.canton.resource.DbStorage
 import com.digitalasset.canton.topology.*
 import com.digitalasset.canton.tracing.TraceContext
 import com.digitalasset.canton.{HasActorSystem, HasExecutionContext}
 import com.google.protobuf.ByteString
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.BackfillingRequirement
+import org.lfdecentralizedtrust.splice.util.EventId
 import org.scalatest.Assertion
 
 import scala.concurrent.Future
 import scala.jdk.CollectionConverters.*
+
+import UpdateHistory.UpdateHistoryResponse
 
 abstract class UpdateHistoryTestBase
     extends StoreTest
@@ -36,7 +39,7 @@ abstract class UpdateHistoryTestBase
   import UpdateHistoryTestBase.*
 
   protected def create(
-      domain: DomainId,
+      domain: SynchronizerId,
       contractId: String,
       offset: Long,
       party: PartyId,
@@ -59,8 +62,8 @@ abstract class UpdateHistoryTestBase
   }
 
   protected def assign(
-      domainTo: DomainId,
-      domainFrom: DomainId,
+      domainTo: SynchronizerId,
+      domainFrom: SynchronizerId,
       contractId: String,
       offset: Long,
       party: PartyId,
@@ -88,8 +91,8 @@ abstract class UpdateHistoryTestBase
   }
 
   protected def unassign(
-      domainFrom: DomainId,
-      domainTo: DomainId,
+      domainFrom: SynchronizerId,
+      domainTo: SynchronizerId,
       contractId: String,
       offset: Long,
       party: PartyId,
@@ -117,7 +120,7 @@ abstract class UpdateHistoryTestBase
   }
 
   protected def createMulti(
-      domain: DomainId,
+      domain: SynchronizerId,
       contractId: String,
       offset: Long,
       party: PartyId,
@@ -153,41 +156,41 @@ abstract class UpdateHistoryTestBase
   protected val endOffset = "9".repeat(16)
 
   protected def singleRootEvent(tree: TransactionTree): TreeEvent = {
-    val rootEventIds = tree.getRootEventIds.asScala
+    val rootEventIds = tree.getRootNodeIds.asScala
     rootEventIds.length should be(1)
     val rootEventId = rootEventIds.headOption.value
     tree.getEventsById.get(rootEventId)
   }
   protected def checkUpdates(
-      actual: Seq[LedgerClient.GetTreeUpdatesResponse],
+      actual: Seq[UpdateHistoryResponse],
       expected: Seq[ExpectedUpdate],
   ): Assertion = {
     actual.length should be(expected.length)
     actual.zip(expected).foreach {
-      case (GetTreeUpdatesResponse(TransactionTreeUpdate(tree), domain), expected) =>
+      case (UpdateHistoryResponse(TransactionTreeUpdate(tree), domain), expected) =>
         val rootEvent = singleRootEvent(tree)
         (rootEvent, expected) match {
-          case (rootEvent: CreatedEvent, ExpectedCreate(cid, domainId)) =>
+          case (rootEvent: CreatedEvent, ExpectedCreate(cid, synchronizerId)) =>
             rootEvent.getContractId should be(cid)
-            domain should be(domainId)
-          case (rootEvent: ExercisedEvent, ExpectedExercise(cid, domainId, choice)) =>
+            domain should be(synchronizerId)
+          case (rootEvent: ExercisedEvent, ExpectedExercise(cid, synchronizerId, choice)) =>
             rootEvent.getContractId should be(cid)
             rootEvent.getChoice should be(choice)
-            domain should be(domainId)
+            domain should be(synchronizerId)
           case (event, expected) =>
             throw new RuntimeException(s"Unexpected event type. event: $event, expected: $expected")
         }
-      case (GetTreeUpdatesResponse(ReassignmentUpdate(update), domain), expected) =>
+      case (UpdateHistoryResponse(ReassignmentUpdate(update), domain), expected) =>
         (update.event, expected) match {
           case (unassign: ReassignmentEvent.Unassign, expected: ExpectedUnassign) =>
             unassign.contractId.contractId should be(expected.cid)
-            domain should be(expected.domainId)
-            unassign.source should be(expected.domainId)
+            domain should be(expected.synchronizerId)
+            unassign.source should be(expected.synchronizerId)
             unassign.target should be(expected.targetDomain)
           case (assign: ReassignmentEvent.Assign, expected: ExpectedAssign) =>
             assign.createdEvent.getContractId should be(expected.cid)
             assign.source should be(expected.sourceDomain)
-            assign.target should be(expected.domainId)
+            assign.target should be(expected.synchronizerId)
           case (event, expected) =>
             throw new RuntimeException(
               s"Unexpected reassignment type. event: $event, expected: $expected"
@@ -207,6 +210,7 @@ abstract class UpdateHistoryTestBase
       domainMigrationId: Long = migration1,
       participantId: ParticipantId = participant1,
       storeName: String = storeName1,
+      backfillingRequired: BackfillingRequirement = BackfillingRequirement.NeedsBackfilling,
   ): UpdateHistory = {
     new UpdateHistory(
       storage,
@@ -217,12 +221,15 @@ abstract class UpdateHistoryTestBase
       storeName,
       participantId,
       updateStreamParty,
+      backfillingRequired,
       loggerFactory,
       enableissue12777Workaround = true,
     )
   }
 
-  override def cleanDb(storage: DbStorage)(implicit traceContext: TraceContext): Future[?] =
+  override def cleanDb(
+      storage: DbStorage
+  )(implicit traceContext: TraceContext): FutureUnlessShutdown[Unit] =
     for {
       _ <- resetAllAppTables(storage)
     } yield ()
@@ -234,8 +241,8 @@ abstract class UpdateHistoryTestBase
   protected val migration1 = 1L
   protected val migration2 = 2L
 
-  protected val domain1: DomainId = DomainId.tryFromString("domain1::domain")
-  protected val domain2: DomainId = DomainId.tryFromString("domain2::domain")
+  protected val domain1: SynchronizerId = SynchronizerId.tryFromString("domain1::domain")
+  protected val domain2: SynchronizerId = SynchronizerId.tryFromString("domain2::domain")
 
   protected val cid1 = validContractId(1)
   protected val cid2 = validContractId(2)
@@ -251,15 +258,22 @@ abstract class UpdateHistoryTestBase
 
 object UpdateHistoryTestBase {
   sealed trait ExpectedUpdate extends Product with Serializable
-  final case class ExpectedCreate(cid: String, domainId: DomainId) extends ExpectedUpdate
-  final case class ExpectedExercise(cid: String, domainId: DomainId, choice: String)
+  final case class ExpectedCreate(cid: String, synchronizerId: SynchronizerId)
+      extends ExpectedUpdate
+  final case class ExpectedExercise(cid: String, synchronizerId: SynchronizerId, choice: String)
       extends ExpectedUpdate
 
-  final case class ExpectedAssign(cid: String, sourceDomain: DomainId, domainId: DomainId)
-      extends ExpectedUpdate
+  final case class ExpectedAssign(
+      cid: String,
+      sourceDomain: SynchronizerId,
+      synchronizerId: SynchronizerId,
+  ) extends ExpectedUpdate
 
-  final case class ExpectedUnassign(cid: String, domainId: DomainId, targetDomain: DomainId)
-      extends ExpectedUpdate
+  final case class ExpectedUnassign(
+      cid: String,
+      synchronizerId: SynchronizerId,
+      targetDomain: SynchronizerId,
+  ) extends ExpectedUpdate
 
   sealed trait LostDataMode
 
@@ -288,19 +302,26 @@ object UpdateHistoryTestBase {
   }
 
   def withoutLostData(
-      response: GetTreeUpdatesResponse,
+      response: UpdateHistoryResponse,
       mode: LostDataMode,
-  ): GetTreeUpdatesResponse = {
+  ): UpdateHistoryResponse = {
     response match {
-      case GetTreeUpdatesResponse(TransactionTreeUpdate(tree), domain) =>
-        GetTreeUpdatesResponse(TransactionTreeUpdate(withoutLostData(tree, mode)), domain)
-      case GetTreeUpdatesResponse(ReassignmentUpdate(transfer), domain) =>
-        GetTreeUpdatesResponse(ReassignmentUpdate(withoutLostData(transfer)), domain)
+      case UpdateHistoryResponse(TransactionTreeUpdate(tree), domain) =>
+        UpdateHistoryResponse(TransactionTreeUpdate(withoutLostData(tree, mode)), domain)
+      case UpdateHistoryResponse(ReassignmentUpdate(transfer), domain) =>
+        UpdateHistoryResponse(ReassignmentUpdate(withoutLostData(transfer)), domain)
       case _ => throw new RuntimeException("Invalid update type")
     }
   }
 
   private def withoutLostData(tree: TransactionTree, mode: LostDataMode): TransactionTree = {
+    // TODO(#17370) - remove this data loss
+    // we recalculate the last descendant id because it's lost during the ingestion and it's recalculated based on the visible events
+    val nodesWithChildren = tree.getEventsById.asScala.view.map {
+      case (nodeId, event: ExercisedEvent) =>
+        nodeId.intValue() -> tree.getChildNodeIds(event).asScala.toSeq.map(_.intValue())
+      case (nodeId, _) => nodeId.intValue() -> Seq.empty
+    }.toMap
     new TransactionTree(
       /*updateId = */ tree.getUpdateId,
       /*commandId = */ if (mode == LostInScanApi) { "" }
@@ -310,9 +331,11 @@ object UpdateHistoryTestBase {
       /*workflowId = */ tree.getWorkflowId,
       /*effectiveAt = */ tree.getEffectiveAt,
       /*offset = */ tree.getOffset,
-      /*eventsById = */ tree.getEventsById.asScala.view.mapValues(withoutLostData).toMap.asJava,
-      /*rootEventIds = */ tree.getRootEventIds,
-      /*domainId = */ tree.getDomainId,
+      /*eventsById = */ tree.getEventsById.asScala.view
+        .mapValues(withoutLostData(nodesWithChildren, _))
+        .toMap
+        .asJava,
+      /*synchronizerId = */ tree.getSynchronizerId,
 
       // We don't care about tracing information in the update history.
       /*traceContext = */ TraceContextOuterClass.TraceContext.getDefaultInstance, // Not preserved
@@ -321,12 +344,15 @@ object UpdateHistoryTestBase {
     )
   }
 
-  private def withoutLostData(event: TreeEvent): TreeEvent = {
+  private def withoutLostData(
+      nodesWithChildren: Map[Int, Seq[Int]],
+      event: TreeEvent,
+  ): TreeEvent = {
     event match {
       case created: CreatedEvent =>
         withoutLostData(created)
       case exercised: ExercisedEvent =>
-        withoutLostData(exercised)
+        withoutLostData(nodesWithChildren, exercised)
       case _ => throw new RuntimeException("Invalid event type")
     }
   }
@@ -338,7 +364,8 @@ object UpdateHistoryTestBase {
       // so this would always end up being the operator party of our own application which is not very useful.
       /*witnessParties = */ java.util.Collections.emptyList(), // Not preserved
 
-      /*eventId = */ created.getEventId,
+      /*offset = */ 0, // not preserved
+      /*nodeId = */ created.getNodeId,
       /*templateId = */ created.getTemplateId,
       /*packageName = */ created.getPackageName,
       /*contractId = */ created.getContractId,
@@ -361,14 +388,18 @@ object UpdateHistoryTestBase {
     )
   }
 
-  private def withoutLostData(exercised: ExercisedEvent): ExercisedEvent = {
+  private def withoutLostData(
+      nodesWithChildren: Map[Int, Seq[Int]],
+      exercised: ExercisedEvent,
+  ): ExercisedEvent = {
     new ExercisedEvent(
       // The witnesses returned by the API is the intersection of actual witnesses according
       // to the daml model with the subscribing parties, and we're always subscribing as a single party,
       // so this would always end up being the operator party of our own application which is not very useful.
       /*witnessParties = */ java.util.Collections.emptyList(), // Not preserved
 
-      /*eventId = */ exercised.getEventId,
+      /*offset = */ 0, // not preserved
+      /*nodeId = */ exercised.getNodeId,
       /*templateId = */ exercised.getTemplateId,
       /*packageName = */ exercised.getPackageName,
       /*interfaceId = */ exercised.getInterfaceId,
@@ -377,8 +408,12 @@ object UpdateHistoryTestBase {
       /*choiceArgument = */ exercised.getChoiceArgument,
       /*actingParties = */ exercised.getActingParties,
       /*consuming = */ exercised.isConsuming,
-      /*childEventIds = */ exercised.getChildEventIds,
+      /*lastDescendedNodeid = */ EventId.lastDescendedNodeFromChildNodeIds(
+        exercised.getNodeId.intValue(),
+        nodesWithChildren,
+      ),
       /*exerciseResult = */ exercised.getExerciseResult,
+      /*implementedInterfaces = */ exercised.getImplementedInterfaces,
     )
   }
 

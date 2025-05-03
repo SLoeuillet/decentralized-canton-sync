@@ -10,13 +10,14 @@ import scala.jdk.CollectionConverters.*
 
 class SvMergeSvRewardStateIntegrationTest extends SvIntegrationTestBase with TriggerTestUtil {
 
-  override def environmentDefinition =
+  override def environmentDefinition
+      : org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition =
     EnvironmentDefinition
       // Single SV to allow direct ledger API submissions as the DSO
       // to create SvRewardState contracts.
       .simpleTopology1Sv(this.getClass.getSimpleName)
 
-  override protected lazy val updateHistoryIgnoredRootCreates: Seq[Identifier] = Seq(
+  override protected lazy val sanityChecksIgnoredRootCreates: Seq[Identifier] = Seq(
     SvRewardState.TEMPLATE_ID_WITH_PACKAGE_ID
   )
 
@@ -44,7 +45,6 @@ class SvMergeSvRewardStateIntegrationTest extends SvIntegrationTestBase with Tri
         "Create a duplicate SvRewardStateContract",
         sv1Backend.participantClientWithAdminToken.ledger_api_extensions.commands.submitJava(
           Seq(dso),
-          optTimeout = None,
           commands = rewardState.data.create().commands.asScala.toSeq,
         ),
       )(

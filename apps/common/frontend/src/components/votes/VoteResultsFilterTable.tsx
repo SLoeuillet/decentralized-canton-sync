@@ -1,7 +1,11 @@
 // Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-import { useVotesHooks } from 'common-frontend';
-import { CopyableTypography, DateDisplay, Loading } from 'common-frontend';
+import { useVotesHooks } from '@lfdecentralizedtrust/splice-common-frontend';
+import {
+  CopyableTypography,
+  DateDisplay,
+  Loading,
+} from '@lfdecentralizedtrust/splice-common-frontend';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import React, { useEffect, useState } from 'react';
@@ -29,9 +33,12 @@ import { VoteResultModalState } from './ListVoteRequests';
 
 dayjs.extend(utc);
 
+// TODO(#16139): switch to VoteRequestResultTableType2 everywhere
 export type VoteRequestResultTableType = 'Executed' | 'Planned' | 'Rejected';
+export type VoteRequestResultTableType2 = 'Executed' | 'Rejected';
 
 interface ListVoteResultsTableProps {
+  supportsVoteEffectivityAndSetConfig: boolean;
   getAction: (action: ActionRequiringConfirmation, staled: boolean) => string;
   tableBodyId: string;
   tableType: VoteRequestResultTableType;
@@ -65,6 +72,7 @@ type VoteResultQueryOptions = {
 const QUERY_LIMIT = 50;
 
 export const VoteResultsFilterTable: React.FC<ListVoteResultsTableProps> = ({
+  supportsVoteEffectivityAndSetConfig,
   getAction,
   tableBodyId,
   tableType,
@@ -235,6 +243,7 @@ export const VoteResultsFilterTable: React.FC<ListVoteResultsTableProps> = ({
           ) {
             return true;
           } else if (
+            !supportsVoteEffectivityAndSetConfig &&
             result.outcome.tag === 'VRO_Accepted' &&
             dayjs(result.outcome.value.effectiveAt).isAfter(now) &&
             tableType === 'Planned'

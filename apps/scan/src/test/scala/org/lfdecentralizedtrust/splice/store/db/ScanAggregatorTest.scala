@@ -18,13 +18,13 @@ import org.lfdecentralizedtrust.splice.util.ResourceTemplateDecoder
 import org.lfdecentralizedtrust.splice.util.TemplateJsonDecoder
 import com.digitalasset.canton.HasExecutionContext
 import com.digitalasset.canton.concurrent.FutureSupervisor
-import com.digitalasset.canton.config.CantonRequireTypes
 import com.digitalasset.canton.data.CantonTimestamp
 import com.daml.metrics.api.noop.NoOpMetricsFactory
 import com.digitalasset.canton.resource.DbStorage
 import com.digitalasset.canton.topology.PartyId
 import com.digitalasset.canton.tracing.TraceContext
-import com.digitalasset.canton.DomainAlias
+import com.digitalasset.canton.SynchronizerAlias
+import com.digitalasset.canton.lifecycle.FutureUnlessShutdown
 import org.lfdecentralizedtrust.splice.codegen.java.splice
 import org.lfdecentralizedtrust.splice.migration.DomainMigrationInfo
 import org.lfdecentralizedtrust.splice.scan.admin.api.client.commands.HttpScanAppClient
@@ -34,13 +34,18 @@ import org.lfdecentralizedtrust.splice.scan.store.TxLogEntry.EntryType
 import scala.concurrent.ExecutionContext
 import com.digitalasset.canton.util.MonadUtil
 import com.digitalasset.canton.topology.ParticipantId
+import org.lfdecentralizedtrust.splice.store.db.TxLogQueries.TxLogStoreId
+import slick.jdbc.JdbcProfile
 
 class ScanAggregatorTest
     extends StoreTest
     with HasExecutionContext
     with StoreErrors
     with SplicePostgresTest
-    with AmuletTransferUtil {
+    with AmuletTransferUtil
+    with AcsJdbcTypes {
+
+  override lazy val profile: JdbcProfile = storage.api.jdbcProfile
 
   val amuletPrice = 1.0
 
@@ -180,7 +185,7 @@ class ScanAggregatorTest
             aggr.aggregateRoundTotals(previousRoundTotals, lastClosedRound),
             "aggregate round totals",
           )
-          .futureValue
+          .futureValueUS
       val roundTotals = aggr.getLastAggregatedRoundTotals().futureValue
       roundTotals shouldBe None
     }
@@ -225,7 +230,7 @@ class ScanAggregatorTest
             aggr.aggregateRoundTotals(previousRoundTotals, lastClosedRound),
             "aggregate round totals",
           )
-          .futureValue
+          .futureValueUS
 
         val roundTotals0 = aggr.getRoundTotals(0L).futureValue.value
         roundTotals0.copy(closedRoundEffectiveAt = CantonTimestamp.MinValue) shouldBe
@@ -319,7 +324,7 @@ class ScanAggregatorTest
             aggr.aggregateRoundTotals(previousRoundTotals, lastClosedRound),
             "aggregate round totals",
           )
-          .futureValue
+          .futureValueUS
         val prevTotals = aggr.getLastAggregatedRoundTotals().futureValue.value
 
         val expectedRound1CumulativeChangeToInitialAmountAsOfRoundZero =
@@ -341,7 +346,7 @@ class ScanAggregatorTest
 
         getTotalAmuletBalanceFromTxLog(
           closedRound,
-          store.storeId,
+          store.txLogStoreId,
         ).futureValue shouldBe prevTotals.totalAmuletBalance
 
         val _ = storage
@@ -349,7 +354,7 @@ class ScanAggregatorTest
             aggr.aggregateRoundTotals(Some(prevTotals), lastRound.toLong),
             "aggregate round totals",
           )
-          .futureValue
+          .futureValueUS
         val lastTotals = aggr.getLastAggregatedRoundTotals().futureValue.value
         val expectedRound10CumulativeChangeToInitialAmountAsOfRoundZero =
           BigDecimal((1 + lastRound) * balanceChangeRoundZero)
@@ -370,7 +375,7 @@ class ScanAggregatorTest
 
         getTotalAmuletBalanceFromTxLog(
           lastRound.toLong,
-          store.storeId,
+          store.txLogStoreId,
         ).futureValue shouldBe lastTotals.totalAmuletBalance
 
         val (round, effectiveAt) = store.getRoundOfLatestData().futureValue
@@ -451,22 +456,22 @@ class ScanAggregatorTest
                 "aggregate",
               )
           }
-          .futureValue
+          .futureValueUS
         val limit = 10
         for (i <- 0 to lastRound.toInt) {
           val round = i.toLong
           val roundPartyTotals = aggr.getRoundPartyTotals(round).futureValue
           roundPartyTotals should contain theSameElementsAs expectedRoundPartyRewardTotals(round)
           val topProviders =
-            getTopProvidersByAppRewardsFromTxLog(round, limit, aggr.storeId).futureValue
+            getTopProvidersByAppRewardsFromTxLog(round, limit, aggr.txLogStoreId).futureValueUS
           topProviders should not be empty
           store.getTopProvidersByAppRewards(round, limit).futureValue shouldBe topProviders
           val topValidatorsByValidatorRewards =
             getTopValidatorsByValidatorRewardsFromTxLog(
               round,
               limit,
-              aggr.storeId,
-            ).futureValue
+              aggr.txLogStoreId,
+            ).futureValueUS
           store
             .getTopValidatorsByValidatorRewards(round, limit)
             .futureValue shouldBe topValidatorsByValidatorRewards
@@ -474,7 +479,7 @@ class ScanAggregatorTest
             getTopValidatorsByPurchasedTrafficFromTxLog(
               round,
               limit,
-              aggr.storeId,
+              aggr.txLogStoreId,
             ).futureValue
           store
             .getTopValidatorsByPurchasedTraffic(round, limit)
@@ -482,14 +487,14 @@ class ScanAggregatorTest
         }
 
         val topProviders =
-          getTopProvidersByAppRewardsFromTxLog(lastRound, limit, aggr.storeId).futureValue
+          getTopProvidersByAppRewardsFromTxLog(lastRound, limit, aggr.txLogStoreId).futureValueUS
         store.getTopProvidersByAppRewards(lastRound, limit).futureValue shouldBe topProviders
 
         val topValidatorsByPurchasedTraffic =
           getTopValidatorsByPurchasedTrafficFromTxLog(
             lastRound,
             limit,
-            aggr.storeId,
+            aggr.txLogStoreId,
           ).futureValue
         store
           .getTopValidatorsByPurchasedTraffic(lastRound, limit)
@@ -511,6 +516,7 @@ class ScanAggregatorTest
       (for {
         _ <- storage
           .update_(aggr.insertRoundTotals(RoundTotals(lastRound, now)), "insert round total")
+          .failOnShutdown("insertRoundTotals")
         res <- store.backFillAggregates()
       } yield {
         res
@@ -539,6 +545,7 @@ class ScanAggregatorTest
       for {
         _ <- storage
           .update_(aggr.insertRoundTotals(prevRoundTotals), "insert round total")
+          .failOnShutdown("insertRoundTotals")
         res <- MonadUtil
           .sequentialTraverse(0 to lastRound.toInt - 1) { _ =>
             store.backFillAggregates()
@@ -652,10 +659,10 @@ class ScanAggregatorTest
       .toMap
   }
 
-  override protected def cleanDb(storage: DbStorage)(implicit traceContext: TraceContext) =
-    for {
-      _ <- resetAllAppTables(storage)
-    } yield ()
+  override protected def cleanDb(storage: DbStorage)(implicit
+      traceContext: TraceContext
+  ): FutureUnlessShutdown[?] =
+    resetAllAppTables(storage)
 
   def mkAggregator(
       dsoParty: PartyId,
@@ -695,7 +702,7 @@ class ScanAggregatorTest
       _ <- store.multiDomainAcsStore.testIngestionSink
         .ingestAcs(nextOffset(), Seq.empty, Seq.empty, Seq.empty)
       _ <- store.domains.ingestionSink.ingestConnectedDomains(
-        Map(DomainAlias.tryCreate(domain) -> dummyDomain)
+        Map(SynchronizerAlias.tryCreate(domain) -> dummyDomain)
       )
       aggr <- store.aggregator
     } yield (aggr, store)
@@ -826,29 +833,35 @@ class ScanAggregatorTest
       .map(_ => ())
   }
 
-  def lengthLimited(s: String): CantonRequireTypes.String2066 =
-    CantonRequireTypes.String2066.tryCreate(s)
-
-  def getTotalAmuletBalanceFromTxLog(asOfEndOfRound: Long, storeId: Int): Future[BigDecimal] =
+  def getTotalAmuletBalanceFromTxLog(
+      asOfEndOfRound: Long,
+      txLogStoreId: TxLogStoreId,
+  ): Future[BigDecimal] =
     for {
-      result <- storage.query(
-        sql"""
+      result <- storage
+        .query(
+          sql"""
                select sum(balance_change_change_to_initial_amount_as_of_round_zero) -
                      ($asOfEndOfRound + 1) * sum(balance_change_change_to_holding_fees_rate)
                from scan_txlog_store
-               where store_id = $storeId
+               where store_id = $txLogStoreId
                  and entry_type = ${EntryType.BalanceChangeTxLogEntry}
                  and round <= $asOfEndOfRound;
              """.as[Option[BigDecimal]].headOption,
-        "getTotalAmuletBalanceFromTxLog",
-      )
+          "getTotalAmuletBalanceFromTxLog",
+        )
+        .failOnShutdown
     } yield result.flatten.getOrElse(0)
 
-  def getTopProvidersByAppRewardsFromTxLog(asOfEndOfRound: Long, limit: Int, storeId: Int) = {
+  def getTopProvidersByAppRewardsFromTxLog(
+      asOfEndOfRound: Long,
+      limit: Int,
+      txLogStoreId: TxLogStoreId,
+  ) = {
     val q = sql"""
         select   rewarded_party, sum(reward_amount) as total_app_rewards
         from     scan_txlog_store
-        where    store_id = $storeId
+        where    store_id = $txLogStoreId
         and      entry_type = ${EntryType.AppRewardTxLogEntry}
         and      round <= $asOfEndOfRound
         group by rewarded_party
@@ -861,12 +874,12 @@ class ScanAggregatorTest
   def getTopValidatorsByValidatorRewardsFromTxLog(
       asOfEndOfRound: Long,
       limit: Int,
-      storeId: Int,
+      txLogStoreId: TxLogStoreId,
   ) = {
     val q = sql"""
         select rewarded_party, sum(reward_amount) as total_validator_rewards
         from   scan_txlog_store
-        where  store_id = $storeId
+        where  store_id = $txLogStoreId
         and    entry_type = ${EntryType.ValidatorRewardTxLogEntry}
         and    round <= $asOfEndOfRound
         group by rewarded_party
@@ -879,25 +892,27 @@ class ScanAggregatorTest
   def getTopValidatorsByPurchasedTrafficFromTxLog(
       asOfEndOfRound: Long,
       limit: Int,
-      storeId: Int,
+      txLogStoreId: TxLogStoreId,
   ): Future[Seq[HttpScanAppClient.ValidatorPurchasedTraffic]] = for {
-    rows <- storage.query(
-      sql"""
+    rows <- storage
+      .query(
+        sql"""
               select extra_traffic_validator                       as validator,
                      count(*)                                      as num_purchases,
                      sum(extra_traffic_purchase_traffic_purchased) as total_traffic_purchased,
                      sum(extra_traffic_purchase_cc_spent)          as total_cc_spent,
                      max(round)                                    as last_purchased_in_round
               from scan_txlog_store
-              where store_id = $storeId
+              where store_id = $txLogStoreId
                 and entry_type = ${EntryType.ExtraTrafficPurchaseTxLogEntry}
                 and round <= $asOfEndOfRound
               group by extra_traffic_validator
               order by total_traffic_purchased desc
               limit $limit;
            """.as[(PartyId, Long, Long, BigDecimal, Long)],
-      "getTopValidatorsByPurchasedTrafficFromTxLog",
-    )
+        "getTopValidatorsByPurchasedTrafficFromTxLog",
+      )
+      .failOnShutdown
   } yield rows.map((HttpScanAppClient.ValidatorPurchasedTraffic.apply _).tupled)
 }
 

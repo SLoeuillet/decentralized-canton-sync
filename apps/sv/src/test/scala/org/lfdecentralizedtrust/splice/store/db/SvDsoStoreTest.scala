@@ -4,7 +4,6 @@ import com.daml.ledger.javaapi.data.codegen.ContractId
 import com.daml.metrics.api.noop.NoOpMetricsFactory
 import org.lfdecentralizedtrust.splice.codegen.java.splice
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletrules.{
-  AmuletRules,
   AmuletRules_MiningRound_Archive,
   AppTransferContext,
 }
@@ -51,7 +50,6 @@ import org.lfdecentralizedtrust.splice.environment.{DarResources, RetryProvider}
 import org.lfdecentralizedtrust.splice.migration.DomainMigrationInfo
 import org.lfdecentralizedtrust.splice.store.{Limit, MiningRoundsStore, PageLimit, StoreTest}
 import org.lfdecentralizedtrust.splice.store.MultiDomainAcsStore.QueryResult
-import org.lfdecentralizedtrust.splice.store.events.DsoRulesCloseVoteRequest
 import org.lfdecentralizedtrust.splice.sv.store.db.DbSvDsoStore
 import org.lfdecentralizedtrust.splice.sv.store.SvDsoStore.{
   IdleAnsSubscription,
@@ -65,10 +63,11 @@ import org.lfdecentralizedtrust.splice.util.{
   ResourceTemplateDecoder,
   TemplateJsonDecoder,
 }
-import com.digitalasset.canton.{DomainAlias, HasActorSystem, HasExecutionContext}
+import com.digitalasset.canton.{HasActorSystem, HasExecutionContext, SynchronizerAlias}
 import com.digitalasset.canton.concurrent.FutureSupervisor
 import com.digitalasset.canton.crypto.Fingerprint
 import com.digitalasset.canton.data.CantonTimestamp
+import com.digitalasset.canton.lifecycle.FutureUnlessShutdown
 import com.digitalasset.canton.resource.DbStorage
 import com.digitalasset.canton.topology.*
 import com.digitalasset.canton.tracing.TraceContext
@@ -1104,7 +1103,7 @@ abstract class SvDsoStoreTest extends StoreTest with HasExecutionContext {
     "listMemberTrafficContracts" should {
 
       "list all MemberTraffic contracts of a member" in {
-        val namespace = Namespace(Fingerprint.tryCreate(s"dummy"))
+        val namespace = Namespace(Fingerprint.tryFromString(s"dummy"))
         val goodMember = ParticipantId("good", namespace)
         val badMember = MediatorId(UniqueIdentifier.tryCreate("bad", namespace))
         val goodContracts = (1 to 3).map(n => memberTraffic(goodMember, dummyDomain, n.toLong))
@@ -1130,7 +1129,7 @@ abstract class SvDsoStoreTest extends StoreTest with HasExecutionContext {
     "getTotalPurchasedMemberTraffic" should {
 
       "return the sum over all traffic contracts for the member" in {
-        val namespace = Namespace(Fingerprint.tryCreate(s"dummy"))
+        val namespace = Namespace(Fingerprint.tryFromString(s"dummy"))
         val goodMember = ParticipantId("good", namespace)
         val badMember = MediatorId(UniqueIdentifier.tryCreate("bad", namespace))
         val goodContracts = (1 to 3).map(n => memberTraffic(goodMember, dummyDomain, n.toLong))
@@ -1297,7 +1296,7 @@ abstract class SvDsoStoreTest extends StoreTest with HasExecutionContext {
       svs: java.util.Map[String, SvInfo] = Collections.emptyMap(),
       epoch: Long = 123,
   ) = {
-    val newDomainId = "new-domain-id"
+    val newSynchronizerId = "new-domain-id"
     val template = new DsoRules(
       dsoParty.toProtoPrimitive,
       epoch,
@@ -1314,7 +1313,11 @@ abstract class SvDsoStoreTest extends StoreTest with HasExecutionContext {
         new RelTime(1),
         new SynchronizerNodeConfigLimits(new CometBftConfigLimits(1, 1, 1, 1, 1)),
         1,
-        new DsoDecentralizedSynchronizerConfig(Collections.emptyMap(), newDomainId, newDomainId),
+        new DsoDecentralizedSynchronizerConfig(
+          Collections.emptyMap(),
+          newSynchronizerId,
+          newSynchronizerId,
+        ),
         Optional.empty(),
       ),
       Collections.emptyMap(),
@@ -1337,11 +1340,15 @@ abstract class SvDsoStoreTest extends StoreTest with HasExecutionContext {
     )
   }
 
-  private def memberTraffic(member: Member, domainId: DomainId, totalPurchased: Long) = {
+  private def memberTraffic(
+      member: Member,
+      synchronizerId: SynchronizerId,
+      totalPurchased: Long,
+  ) = {
     val template = new MemberTraffic(
       dsoParty.toProtoPrimitive,
       member.toProtoPrimitive,
-      domainId.toProtoPrimitive,
+      synchronizerId.toProtoPrimitive,
       domainMigrationId,
       totalPurchased,
       1,
@@ -1527,120 +1534,145 @@ class DbSvDsoStoreTest
       _ <- store.multiDomainAcsStore.testIngestionSink
         .ingestAcs(acsOffset, Seq.empty, Seq.empty, Seq.empty)
       _ <- store.domains.ingestionSink.ingestConnectedDomains(
-        Map(DomainAlias.tryCreate(domain) -> dummyDomain)
+        Map(SynchronizerAlias.tryCreate(domain) -> dummyDomain)
       )
     } yield store
   }
 
-  "listVoteRequestResults" should {
+  "listVoteRequestsReadyToBeClosed" should {
 
-    "list all past VoteRequestResult" in {
+    val votesAccept =
+      (1 to 4).map(n => new Vote(userParty(n).toProtoPrimitive, true, new Reason("", "")))
+    val votesRefuse =
+      (1 to 4).map(n => new Vote(userParty(n).toProtoPrimitive, false, new Reason("", "")))
+    val nowMinus2Hours = Instant.now.truncatedTo(ChronoUnit.MICROS).minusSeconds(7200)
+    val nowMinus1Hour = Instant.now.truncatedTo(ChronoUnit.MICROS).minusSeconds(3600)
+    val nowPlus1Hour = Instant.now.truncatedTo(ChronoUnit.MICROS).plusSeconds(3600)
+    val nowPlus2Hours = Instant.now.truncatedTo(ChronoUnit.MICROS).plusSeconds(7200)
+
+    "list only vote requests without `targetEffectiveAt` that are ready to be closed" in {
+      val readyToBeClosed = Seq(
+        // expiry reached
+        voteRequest(requester = userParty(1), votes = votesAccept, expiry = nowMinus1Hour),
+        voteRequest(requester = userParty(1), votes = votesRefuse, expiry = nowMinus1Hour),
+        voteRequest(requester = userParty(2), votes = Seq.empty, expiry = nowMinus1Hour),
+        // expiry not reached, but early closing
+        voteRequest(requester = userParty(3), votes = votesAccept, expiry = nowPlus1Hour),
+        voteRequest(requester = userParty(3), votes = votesRefuse, expiry = nowPlus1Hour),
+      )
+      val notReadyToBeClosed = Seq(
+        voteRequest(requester = userParty(1), votes = Seq.empty, expiry = nowPlus1Hour)
+      )
+      val svs = Map(
+        "sv1" -> new SvInfo("sv1", new Round(0L), 1L, "df"),
+        "sv2" -> new SvInfo("sv2", new Round(0L), 1L, "df"),
+        "sv3" -> new SvInfo("sv3", new Round(0L), 1L, "df"),
+        "sv4" -> new SvInfo("sv4", new Round(0L), 1L, "df"),
+      ).asJava
       for {
         store <- mkStore()
-        voteRequestContract1 = voteRequest(
-          requester = userParty(1),
-          votes = (1 to 4)
-            .map(n => new Vote(userParty(n).toProtoPrimitive, true, new Reason("", ""))),
+        _ <- dummyDomain.create(dsoRules(svs))(store.multiDomainAcsStore)
+        _ <- dummyDomain.create(amuletRules())(store.multiDomainAcsStore)
+        _ <- MonadUtil.sequentialTraverse(readyToBeClosed ++ notReadyToBeClosed)(
+          dummyDomain.create(_)(store.multiDomainAcsStore)
         )
-        _ <- dummyDomain.create(voteRequestContract1)(store.multiDomainAcsStore)
-        result1 = mkVoteRequestResult(
-          voteRequestContract1
-        )
-        _ <- dummyDomain.exercise(
-          contract = dsoRules(),
-          interfaceId = Some(DsoRules.TEMPLATE_ID_WITH_PACKAGE_ID),
-          choiceName = DsoRulesCloseVoteRequest.choice.name,
-          mkCloseVoteRequest(
-            voteRequestContract1.contractId
-          ),
-          result1.toValue,
-        )(
-          store.multiDomainAcsStore
-        )
-        voteRequestContract2 = voteRequest(
-          requester = userParty(2),
-          votes = (1 to 4)
-            .map(n => new Vote(userParty(n).toProtoPrimitive, true, new Reason("", ""))),
-        )
-        _ <- dummyDomain.create(voteRequestContract2)(store.multiDomainAcsStore)
-        result2 = mkVoteRequestResult(
-          voteRequestContract2,
-          effectiveAt = Instant.now().plusSeconds(1).truncatedTo(ChronoUnit.MICROS),
-        )
-        _ <- dummyDomain.exercise(
-          contract = dsoRules(),
-          interfaceId = Some(DsoRules.TEMPLATE_ID_WITH_PACKAGE_ID),
-          choiceName = DsoRulesCloseVoteRequest.choice.name,
-          mkCloseVoteRequest(
-            voteRequestContract2.contractId
-          ),
-          result2.toValue,
-        )(
-          store.multiDomainAcsStore
-        )
+        result <- store.listVoteRequestsReadyToBeClosed(
+          CantonTimestamp.now(),
+          PageLimit.tryCreate(100),
+        )(traceContext)
       } yield {
-        store
-          .listVoteRequestResults(
-            Some("AddSv"),
-            Some(true),
-            None,
-            None,
-            None,
-            PageLimit.tryCreate(1),
-          )
-          .futureValue
-          .toList
-          .loneElement shouldBe result2
-        store
-          .listVoteRequestResults(
-            Some("SRARC_AddSv"),
-            Some(false),
-            None,
-            None,
-            None,
-            PageLimit.tryCreate(1),
-          )
-          .futureValue
-          .toList
-          .size shouldBe (0)
-        store
-          .listVoteRequestResults(
-            None,
-            None,
-            None,
-            None,
-            None,
-            PageLimit.tryCreate(1),
-          )
-          .futureValue
-          .toList
-          .size shouldBe (1)
-        store
-          .listVoteRequestResults(
-            None,
-            None,
-            None,
-            Some(Instant.now().truncatedTo(ChronoUnit.MICROS).plusSeconds(3600).toString),
-            None,
-            PageLimit.tryCreate(1),
-          )
-          .futureValue
-          .toList
-          .size shouldBe (0)
-        store
-          .listVoteRequestResults(
-            None,
-            None,
-            None,
-            Some(Instant.now().truncatedTo(ChronoUnit.MICROS).minusSeconds(3600).toString),
-            None,
-            PageLimit.tryCreate(1),
-          )
-          .futureValue
-          .toList
-          .size shouldBe (1)
+        val contracts = result.map(_.contract)
+        contracts should contain theSameElementsAs readyToBeClosed
       }
     }
+
+    "list only vote requests with `targetEffectiveAt` that are ready to be closed" in {
+      val readyToBeClosed = Seq(
+        // effectiveAt reached
+        voteRequest(
+          requester = userParty(1),
+          votes = votesAccept,
+          expiry = nowMinus2Hours,
+          effectiveAt = Optional.of(nowMinus1Hour),
+        ),
+        voteRequest(
+          requester = userParty(1),
+          votes = votesRefuse,
+          expiry = nowMinus2Hours,
+          effectiveAt = Optional.of(nowMinus1Hour),
+        ),
+        voteRequest(
+          requester = userParty(2),
+          votes = Seq.empty,
+          expiry = nowMinus2Hours,
+          effectiveAt = Optional.of(nowMinus1Hour),
+        ),
+        // between expiration and effectiveAt
+        voteRequest(
+          requester = userParty(2),
+          votes = Seq.empty,
+          expiry = nowMinus1Hour,
+          effectiveAt = Optional.of(nowPlus1Hour),
+        ),
+        // early closing only possible if super-majority refuse
+        voteRequest(
+          requester = userParty(2),
+          votes = votesRefuse,
+          expiry = nowMinus1Hour,
+          effectiveAt = Optional.of(nowPlus1Hour),
+        ),
+        voteRequest(
+          requester = userParty(1),
+          votes = votesRefuse,
+          expiry = nowPlus1Hour,
+          effectiveAt = Optional.of(nowPlus2Hours),
+        ),
+      )
+      val notReadyToBeClosed = Seq(
+        // effectiveAt not reached
+        voteRequest(
+          requester = userParty(1),
+          votes = votesAccept,
+          expiry = nowPlus1Hour,
+          effectiveAt = Optional.of(nowPlus2Hours),
+        ),
+        voteRequest(
+          requester = userParty(2),
+          votes = Seq.empty,
+          expiry = nowPlus1Hour,
+          effectiveAt = Optional.of(nowPlus2Hours),
+        ),
+        // between expiration and effectiveAt
+        voteRequest(
+          requester = userParty(2),
+          votes = votesAccept,
+          expiry = nowMinus1Hour,
+          effectiveAt = Optional.of(nowPlus1Hour),
+        ),
+      )
+      val svs = Map(
+        "sv1" -> new SvInfo("sv1", new Round(0L), 1L, "df"),
+        "sv2" -> new SvInfo("sv2", new Round(0L), 1L, "df"),
+        "sv3" -> new SvInfo("sv3", new Round(0L), 1L, "df"),
+        "sv4" -> new SvInfo("sv4", new Round(0L), 1L, "df"),
+      ).asJava
+      for {
+        store <- mkStore()
+        _ <- dummyDomain.create(dsoRules(svs))(store.multiDomainAcsStore)
+        _ <- dummyDomain.create(amuletRules())(store.multiDomainAcsStore)
+        _ <- MonadUtil.sequentialTraverse(readyToBeClosed ++ notReadyToBeClosed)(
+          dummyDomain.create(_)(store.multiDomainAcsStore)
+        )
+        result <- store.listVoteRequestsReadyToBeClosed(
+          CantonTimestamp.now(),
+          PageLimit.tryCreate(100),
+        )(traceContext)
+      } yield {
+        val contracts = result.map(_.contract)
+        contracts should contain theSameElementsAs readyToBeClosed
+      }
+    }
+
   }
 
   "listExpiredVoteRequests" should {
@@ -1763,95 +1795,7 @@ class DbSvDsoStoreTest
     }
   }
 
-  "lookupContractByDateTime" should {
-
-    "find the DsoRules contract at a given time" in {
-      val now = CantonTimestamp.now()
-      val firstDsoRules = dsoRules(epoch = 1)
-      val secondDsoRules = dsoRules(epoch = 2)
-      val thirdDsoRules = dsoRules(epoch = 3)
-      val recordTimeFirst = now.plusSeconds(1).toInstant
-      val recordTimeSecond = now.plusSeconds(5).toInstant
-      val recordTimeThird = now.plusSeconds(9).toInstant
-      for {
-        store <- mkStore()
-        _ <- store.updateHistory.ingestionSink.initialize()
-        first <- dummyDomain.create(
-          firstDsoRules,
-          recordTime = recordTimeFirst,
-          packageName = "splice-dso-governance",
-        )(
-          store.updateHistory
-        )
-        firstRecordTime = CantonTimestamp.fromInstant(first.getRecordTime).getOrElse(now)
-        _ <- dummyDomain.create(
-          secondDsoRules,
-          recordTime = recordTimeSecond,
-          packageName = "splice-dso-governance",
-        )(store.updateHistory)
-        _ <- dummyDomain.create(
-          thirdDsoRules,
-          recordTime = recordTimeThird,
-          packageName = "splice-dso-governance",
-        )(store.updateHistory)
-        result <- store.lookupContractByRecordTime(
-          DsoRules.COMPANION,
-          firstRecordTime.plusSeconds(1),
-        )
-      } yield {
-        result.value should not be firstDsoRules
-        result.value shouldBe secondDsoRules
-        result.value should not be thirdDsoRules
-      }
-    }
-
-    "find the AmuletRules contract at a given time" in {
-      val now = CantonTimestamp.now()
-      val firstAmuletRules = amuletRules(10)
-      val secondAmuletRules = amuletRules(20)
-      val thirdAmuletRules = amuletRules(30)
-      val recordTimeFirst = now.plusSeconds(1).toInstant
-      val recordTimeSecond = now.plusSeconds(5).toInstant
-      val recordTimeThird = now.plusSeconds(9).toInstant
-      for {
-        store <- mkStore()
-        _ <- store.updateHistory.ingestionSink.initialize()
-        first <- dummyDomain.create(
-          firstAmuletRules,
-          recordTime = recordTimeFirst,
-          packageName = "splice-amulet",
-        )(
-          store.updateHistory
-        )
-        firstRecordTime = CantonTimestamp.fromInstant(first.getRecordTime).getOrElse(now)
-        _ <- dummyDomain.create(
-          secondAmuletRules,
-          recordTime = recordTimeSecond,
-          packageName = "splice-amulet",
-        )(
-          store.updateHistory
-        )
-        _ <- dummyDomain.create(
-          thirdAmuletRules,
-          recordTime = recordTimeThird,
-          packageName = "splice-amulet",
-        )(store.updateHistory)
-        result <- store.lookupContractByRecordTime(
-          AmuletRules.COMPANION,
-          firstRecordTime.plusSeconds(1),
-        )
-      } yield {
-        result.value should not be firstAmuletRules
-        result.value shouldBe secondAmuletRules
-        result.value should not be thirdAmuletRules
-      }
-    }
-  }
-
   override protected def cleanDb(
       storage: DbStorage
-  )(implicit traceContext: TraceContext): Future[?] =
-    for {
-      _ <- resetAllAppTables(storage)
-    } yield ()
+  )(implicit traceContext: TraceContext): FutureUnlessShutdown[?] = resetAllAppTables(storage)
 }

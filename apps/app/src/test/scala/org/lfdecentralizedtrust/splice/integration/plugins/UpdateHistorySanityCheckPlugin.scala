@@ -5,7 +5,7 @@ import com.daml.ledger.javaapi.data.Identifier
 import org.lfdecentralizedtrust.splice.config.ConfigTransforms.updateAllScanAppConfigs_
 import org.lfdecentralizedtrust.splice.config.SpliceConfig
 import org.lfdecentralizedtrust.splice.console.ScanAppBackendReference
-import org.lfdecentralizedtrust.splice.environment.EnvironmentImpl
+import org.lfdecentralizedtrust.splice.environment.SpliceEnvironment
 import org.lfdecentralizedtrust.splice.http.v0.definitions.DamlValueEncoding.members.CompactJson
 import org.lfdecentralizedtrust.splice.http.v0.definitions.{AcsResponse, UpdateHistoryItem}
 import org.lfdecentralizedtrust.splice.http.v0.definitions.UpdateHistoryItem.members
@@ -18,6 +18,7 @@ import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.integration.EnvironmentSetupPlugin
 import com.digitalasset.canton.logging.NamedLoggerFactory
 import com.digitalasset.canton.tracing.TraceContext
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.BackfillingState
 import org.scalatest.{Inspectors, LoneElement}
 import org.scalatest.concurrent.Eventually
 import org.scalatest.matchers.should.Matchers
@@ -40,7 +41,7 @@ class UpdateHistorySanityCheckPlugin(
     ignoredRootCreates: Seq[Identifier],
     ignoredRootExercises: Seq[(Identifier, String)],
     protected val loggerFactory: NamedLoggerFactory,
-) extends EnvironmentSetupPlugin[EnvironmentImpl, SpliceTestConsoleEnvironment]
+) extends EnvironmentSetupPlugin[SpliceConfig, SpliceEnvironment]
     with Matchers
     with Eventually
     with Inspectors
@@ -138,6 +139,7 @@ class UpdateHistorySanityCheckPlugin(
         case (otherItem, idx) if founderComparable(idx) != otherItem =>
           otherItem -> founderComparable(idx)
       }
+
       different should be(empty)
     }
   }
@@ -215,8 +217,7 @@ class UpdateHistorySanityCheckPlugin(
         eventually {
           scan.automation.store.updateHistory
             .getBackfillingState()
-            .futureValue
-            .exists(_.complete) should be(true)
+            .futureValue should be(BackfillingState.Complete)
         }(
           patienceConfigForBackfillingInit,
           implicitly[org.scalatest.enablers.Retrying[org.scalatest.Assertion]],

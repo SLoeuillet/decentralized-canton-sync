@@ -1,12 +1,10 @@
 package org.lfdecentralizedtrust.splice.integration.tests.upgrades
 
-import org.lfdecentralizedtrust.splice.environment.{EnvironmentImpl, DarResources}
+import org.lfdecentralizedtrust.splice.environment.DarResources
 import org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition
-import org.lfdecentralizedtrust.splice.integration.tests.SpliceTests.SpliceTestConsoleEnvironment
 import org.lfdecentralizedtrust.splice.integration.tests.FrontendIntegrationTestWithSharedEnvironment
 import org.lfdecentralizedtrust.splice.integration.tests.runbook.SvUiPreflightIntegrationTestUtil
 import org.lfdecentralizedtrust.splice.util.SvFrontendTestUtil
-import com.digitalasset.canton.integration.BaseEnvironmentDefinition
 import org.openqa.selenium.By
 import org.openqa.selenium.support.ui.Select
 
@@ -30,8 +28,7 @@ class DamlCIUpgradeVotePreflightTest
 
   override lazy val resetRequiredTopologyState: Boolean = false
 
-  override def environmentDefinition
-      : BaseEnvironmentDefinition[EnvironmentImpl, SpliceTestConsoleEnvironment] =
+  override def environmentDefinition: SpliceEnvironmentDefinition =
     EnvironmentDefinition.preflightTopology(
       this.getClass.getSimpleName
     )
@@ -52,12 +49,12 @@ class DamlCIUpgradeVotePreflightTest
         withWebUiSv(1) { implicit webDriver =>
           click on "navlink-votes"
           val dropDownAction = new Select(webDriver.findElement(By.id("display-actions")))
-          dropDownAction.selectByValue("CRARC_AddFutureAmuletConfigSchedule")
+          dropDownAction.selectByValue("CRARC_SetConfig")
 
           // 20m to be effective so as to give enough time to upgrade the SV and Validator runbooks.
           // The expiration doesn't matter so as long as it's enough for SVs to vote, but it needs to be less than the effective date.
           Seq(
-            "datetime-picker-amulet-configuration" -> 20L,
+            "datetime-picker-vote-request-effectivity" -> 20L,
             "datetime-picker-vote-request-expiration" -> 5L,
           ).foreach { case (picker, minutes) =>
             setDateTime(
@@ -111,15 +108,17 @@ class DamlCIUpgradeVotePreflightTest
         }
       }
 
-      clue("The vote passes because all SVs accepted it") {
+      clue("The request is displayed in the in progress section") {
         withWebUiSv(1) { implicit webDriver =>
           click on "navlink-votes"
-          click on "tab-panel-planned"
+          click on "tab-panel-in-progress"
 
-          val tbody = find(id("sv-vote-results-planned-table-body"))
+          val tbody = find(id("sv-voting-in-progress-table-body"))
           inside(tbody) { case Some(tb) =>
-            val rows = tb.findAllChildElements(className("vote-row-action")).toSeq
-            rows.size shouldBe 1
+            eventually() {
+              val rows = tb.findAllChildElements(className("vote-row-action")).toSeq
+              rows.size shouldBe 1
+            }
           }
         }
       }

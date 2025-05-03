@@ -6,14 +6,12 @@ import ConfigTransforms.{ConfigurableApp, updateAutomationConfig}
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletrules.AmuletRules
 import org.lfdecentralizedtrust.splice.codegen.java.splice.dso.svstate.SvNodeState
 import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.DsoRules
-import org.lfdecentralizedtrust.splice.environment.EnvironmentImpl
 import org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition
 import org.lfdecentralizedtrust.splice.integration.tests.SpliceTests.{
   IntegrationTest,
   SpliceTestConsoleEnvironment,
 }
 import org.lfdecentralizedtrust.splice.util.*
-import com.digitalasset.canton.integration.BaseEnvironmentDefinition
 import com.digitalasset.canton.topology.PartyId
 import org.lfdecentralizedtrust.splice.wallet.automation.CollectRewardsAndMergeAmuletsTrigger
 import org.lfdecentralizedtrust.splice.sv.automation.delegatebased.{
@@ -39,14 +37,9 @@ import org.apache.pekko.http.scaladsl.unmarshalling.Unmarshal
 
 import scala.util.Success
 
-class ScanIntegrationTest
-    extends IntegrationTest
-    with ConfigScheduleUtil
-    with WalletTestUtil
-    with TimeTestUtil {
+class ScanIntegrationTest extends IntegrationTest with WalletTestUtil with TimeTestUtil {
   private val defaultPageSize = Limit.MaxPageSize
-  override def environmentDefinition
-      : BaseEnvironmentDefinition[EnvironmentImpl, SpliceTestConsoleEnvironment] =
+  override def environmentDefinition: SpliceEnvironmentDefinition =
     EnvironmentDefinition
       .simpleTopology1Sv(this.getClass.getSimpleName)
       .addConfigTransforms((_, config) =>
@@ -657,42 +650,6 @@ class ScanIntegrationTest
         //          ) ++ faucetAmounts)
         //        }
       }
-    }
-  }
-
-  "list minted amulets" in { implicit env =>
-    val sv1UserParty = onboardWalletUser(sv1WalletClient, sv1ValidatorBackend)
-    val mintAmount = 47.0
-    clue("Mint to get some amulets") {
-      actAndCheck(
-        "sv1 mints amulets", {
-          mintAmulet(
-            sv1ValidatorBackend.participantClientWithAdminToken,
-            sv1UserParty,
-            mintAmount,
-          )
-        },
-      )(
-        "Amulets should appear in sv1's wallet",
-        _ => {
-          sv1WalletClient.list().amulets should have length 1
-          sv1WalletClient.list().amulets.loneElement.effectiveAmount should be(
-            BigDecimal(mintAmount)
-          )
-        },
-      )
-    }
-    eventually() {
-      val sv1Mints = sv1ScanBackend
-        .listActivity(None, defaultPageSize)
-        .flatMap(_.mint)
-        .filter(_.amuletOwner == sv1UserParty.toProtoPrimitive)
-      BigDecimal(sv1Mints.loneElement.amuletAmount) shouldBe BigDecimal(mintAmount)
-      val sv1MintsFromHistory = sv1ScanBackend
-        .listTransactions(None, TransactionHistoryRequest.SortOrder.Desc, defaultPageSize)
-        .flatMap(_.mint)
-        .filter(_.amuletOwner == sv1UserParty.toProtoPrimitive)
-      BigDecimal(sv1MintsFromHistory.loneElement.amuletAmount) shouldBe BigDecimal(mintAmount)
     }
   }
 

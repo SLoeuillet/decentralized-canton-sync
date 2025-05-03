@@ -3,7 +3,6 @@
 
 package org.lfdecentralizedtrust.splice.validator.store.db
 
-import cats.implicits.*
 import com.digitalasset.canton.config.NonNegativeFiniteDuration
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletrules.{
   ExternalPartySetupProposal,
@@ -35,9 +34,11 @@ import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.lifecycle.CloseContext
 import com.digitalasset.canton.logging.NamedLoggerFactory
 import com.digitalasset.canton.resource.DbStorage
-import com.digitalasset.canton.topology.{DomainId, ParticipantId, PartyId}
+import com.digitalasset.canton.topology.{ParticipantId, PartyId, SynchronizerId}
 import com.digitalasset.canton.tracing.TraceContext
 import org.lfdecentralizedtrust.splice.automation.MultiDomainExpiredContractTrigger.ListExpiredContracts
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.BackfillingRequirement
+import org.lfdecentralizedtrust.splice.store.db.AcsQueries.AcsStoreId
 import slick.jdbc.canton.ActionBasedSQLInterpolation.Implicits.actionBasedSQLInterpolationCanton
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -58,7 +59,7 @@ class DbValidatorStore(
       acsTableName = ValidatorTables.acsTableName,
       // Any change in the store descriptor will lead to previously deployed applications
       // forgetting all persisted data once they upgrade to the new version.
-      storeDescriptor = StoreDescriptor(
+      acsStoreDescriptor = StoreDescriptor(
         version = 1,
         name = "DbValidatorStore",
         party = key.validatorParty,
@@ -71,6 +72,7 @@ class DbValidatorStore(
       domainMigrationInfo = domainMigrationInfo,
       participantId = participantId,
       enableissue12777Workaround = false,
+      BackfillingRequirement.BackfillingNotRequired,
     )
     with ValidatorStore
     with AcsTables
@@ -88,8 +90,9 @@ class DbValidatorStore(
       ] = ValidatorStore.contractFilter(key, domainMigrationId)
 
   import multiDomainAcsStore.waitUntilAcsIngested
+  import org.lfdecentralizedtrust.splice.util.FutureUnlessShutdownUtil.futureUnlessShutdownToFuture
 
-  private def storeId: Int = multiDomainAcsStore.storeId
+  private def acsStoreId: AcsStoreId = multiDomainAcsStore.acsStoreId
   override def domainMigrationId: Long = domainMigrationInfo.currentMigrationId
 
   override def lookupInstallByParty(
@@ -101,7 +104,7 @@ class DbValidatorStore(
       .querySingle(
         selectFromAcsTable(
           ValidatorTables.acsTableName,
-          storeId,
+          acsStoreId,
           domainMigrationId,
           where = sql"""template_id_qualified_name = ${QualifiedName(
               walletCodegen.WalletAppInstall.TEMPLATE_ID_WITH_PACKAGE_ID
@@ -122,7 +125,7 @@ class DbValidatorStore(
       .querySingle(
         selectFromAcsTable(
           ValidatorTables.acsTableName,
-          storeId,
+          acsStoreId,
           domainMigrationId,
           where = sql"""template_id_qualified_name = ${QualifiedName(
               walletCodegen.WalletAppInstall.TEMPLATE_ID_WITH_PACKAGE_ID
@@ -143,7 +146,7 @@ class DbValidatorStore(
       .querySingle(
         selectFromAcsTable(
           ValidatorTables.acsTableName,
-          storeId,
+          acsStoreId,
           domainMigrationId,
           where = sql"""template_id_qualified_name = ${QualifiedName(
               amuletCodegen.FeaturedAppRight.TEMPLATE_ID_WITH_PACKAGE_ID
@@ -167,7 +170,7 @@ class DbValidatorStore(
         .querySingle(
           selectFromAcsTableWithStateAndOffset(
             ValidatorTables.acsTableName,
-            storeId,
+            acsStoreId,
             domainMigrationId,
             sql"""
             template_id_qualified_name = ${QualifiedName(
@@ -198,7 +201,7 @@ class DbValidatorStore(
             .query(
               selectFromAcsTableWithState(
                 ValidatorTables.acsTableName,
-                storeId,
+                acsStoreId,
                 domainMigrationId,
                 sql"""
                    template_id_qualified_name = ${QualifiedName(
@@ -225,7 +228,7 @@ class DbValidatorStore(
         .querySingle(
           selectFromAcsTableWithStateAndOffset(
             ValidatorTables.acsTableName,
-            storeId,
+            acsStoreId,
             domainMigrationId,
             where = sql"""
                 template_id_qualified_name = ${QualifiedName(
@@ -259,7 +262,7 @@ class DbValidatorStore(
         .querySingle(
           selectFromAcsTableWithStateAndOffset(
             ValidatorTables.acsTableName,
-            storeId,
+            acsStoreId,
             domainMigrationId,
             where = sql"""
                 template_id_qualified_name = ${QualifiedName(
@@ -294,7 +297,7 @@ class DbValidatorStore(
         .querySingle(
           selectFromAcsTableWithStateAndOffset(
             ValidatorTables.acsTableName,
-            storeId,
+            acsStoreId,
             domainMigrationId,
             sql"""
             template_id_qualified_name = ${QualifiedName(
@@ -329,7 +332,7 @@ class DbValidatorStore(
         .querySingle(
           selectFromAcsTableWithStateAndOffset(
             ValidatorTables.acsTableName,
-            storeId,
+            acsStoreId,
             domainMigrationId,
             sql"""
             template_id_qualified_name = ${QualifiedName(
@@ -351,7 +354,7 @@ class DbValidatorStore(
   }
 
   override def lookupValidatorTopUpStateWithOffset(
-      domainId: DomainId
+      synchronizerId: SynchronizerId
   )(implicit traceContext: TraceContext): Future[QueryResult[Option[Contract[
     topupCodegen.ValidatorTopUpState.ContractId,
     topupCodegen.ValidatorTopUpState,
@@ -361,13 +364,13 @@ class DbValidatorStore(
         .querySingle(
           selectFromAcsTableWithOffset(
             ValidatorTables.acsTableName,
-            storeId,
+            acsStoreId,
             domainMigrationId,
             sql"""
             template_id_qualified_name = ${QualifiedName(
                 topupCodegen.ValidatorTopUpState.TEMPLATE_ID_WITH_PACKAGE_ID
               )}
-              and traffic_domain_id = $domainId
+              and traffic_domain_id = $synchronizerId
             """,
             sql"limit 1",
           ).headOption,

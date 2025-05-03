@@ -1,9 +1,12 @@
 // Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 import * as openapi from 'sv-openapi';
+import { useUserState } from '@lfdecentralizedtrust/splice-common-frontend';
+import {
+  BaseApiMiddleware,
+  OpenAPILoggingMiddleware,
+} from '@lfdecentralizedtrust/splice-common-frontend-utils';
 import BigNumber from 'bignumber.js';
-import { useUserState } from 'common-frontend';
-import { BaseApiMiddleware, OpenAPILoggingMiddleware } from 'common-frontend-utils';
 import React, { useContext, useMemo } from 'react';
 import {
   CastVoteRequest,
@@ -29,7 +32,7 @@ import {
   UpdateAmuletPriceVoteRequest,
 } from 'sv-openapi';
 
-import { RelTime } from '@daml.js/b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946/lib/DA/Time/Types';
+import { RelTime } from '@daml.js/daml-stdlib-DA-Time-Types-1.0.0/lib/DA/Time/Types/module';
 import { ActionRequiringConfirmation } from '@daml.js/splice-dso-governance/lib/Splice/DsoRules/module';
 
 const SvAdminContext = React.createContext<SvAdminClient | undefined>(undefined);
@@ -47,7 +50,8 @@ export interface SvAdminClient {
     action: ActionRequiringConfirmation,
     url: string,
     description: string,
-    expiration: RelTime
+    expiration: RelTime,
+    effectiveTime?: Date
   ) => Promise<void>;
   listDsoRulesVoteRequests: () => Promise<ListDsoRulesVoteRequestsResponse>;
   listVoteRequestResults: (
@@ -79,6 +83,7 @@ export interface SvAdminClient {
   getCometBftNodeDebug: () => Promise<openapi.CometBftNodeDumpOrErrorResponse>;
   getSequencerNodeStatus: () => Promise<openapi.NodeStatus>;
   getMediatorNodeStatus: () => Promise<openapi.NodeStatus>;
+  featureSupport: () => Promise<openapi.FeatureSupportResponse>;
 }
 
 class ApiMiddleware
@@ -117,7 +122,8 @@ export const SvAdminClientProvider: React.FC<React.PropsWithChildren<SvAdminProp
         action: ActionRequiringConfirmation,
         url,
         description,
-        expiration
+        expiration,
+        effectiveAt
       ): Promise<void> => {
         const request: CreateVoteRequest = {
           requester,
@@ -125,6 +131,7 @@ export const SvAdminClientProvider: React.FC<React.PropsWithChildren<SvAdminProp
           url,
           description,
           expiration: RelTime.encode(expiration),
+          effectiveTime: effectiveAt,
         };
         return await svAdminClient.createVoteRequest(request);
       },
@@ -210,6 +217,9 @@ export const SvAdminClientProvider: React.FC<React.PropsWithChildren<SvAdminProp
       },
       getMediatorNodeStatus: async (): Promise<openapi.NodeStatus> => {
         return await svAdminClient.getMediatorNodeStatus();
+      },
+      featureSupport: async (): Promise<openapi.FeatureSupportResponse> => {
+        return await svAdminClient.featureSupport();
       },
     };
   }, [url, userAccessToken]);

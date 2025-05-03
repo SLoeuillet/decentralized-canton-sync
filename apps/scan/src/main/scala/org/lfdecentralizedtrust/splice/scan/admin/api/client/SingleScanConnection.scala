@@ -4,11 +4,13 @@
 package org.lfdecentralizedtrust.splice.scan.admin.api.client
 
 import cats.data.OptionT
+import cats.syntax.either.*
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amulet.FeaturedAppRight
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletrules.{
   AmuletRules,
   TransferPreapproval,
 }
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.DsoRules
 import org.lfdecentralizedtrust.splice.codegen.java.splice.externalpartyamuletrules.{
   ExternalPartyAmuletRules,
   TransferCommandCounter,
@@ -19,7 +21,6 @@ import org.lfdecentralizedtrust.splice.codegen.java.splice.round.{
 }
 import org.lfdecentralizedtrust.splice.codegen.java.splice.ans.AnsRules
 import org.lfdecentralizedtrust.splice.config.UpgradesConfig
-import org.lfdecentralizedtrust.splice.environment.ledger.api.LedgerClient
 import org.lfdecentralizedtrust.splice.environment.{
   HttpAppConnection,
   RetryProvider,
@@ -37,6 +38,7 @@ import org.lfdecentralizedtrust.splice.scan.admin.api.client.commands.{
 import org.lfdecentralizedtrust.splice.scan.config.ScanAppClientConfig
 import org.lfdecentralizedtrust.splice.scan.store.db.ScanAggregator
 import org.lfdecentralizedtrust.splice.store.HistoryBackfilling.SourceMigrationInfo
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.UpdateHistoryResponse
 import org.lfdecentralizedtrust.splice.util.{
   Codec,
   Contract,
@@ -46,7 +48,7 @@ import org.lfdecentralizedtrust.splice.util.{
 import com.digitalasset.canton.config.NonNegativeFiniteDuration
 import com.digitalasset.canton.logging.NamedLoggerFactory
 import com.digitalasset.canton.time.Clock
-import com.digitalasset.canton.topology.{DomainId, PartyId}
+import com.digitalasset.canton.topology.{SynchronizerId, PartyId}
 import com.digitalasset.canton.tracing.TraceContext
 import com.google.protobuf.ByteString
 import org.apache.pekko.stream.Materializer
@@ -54,6 +56,11 @@ import org.apache.pekko.stream.Materializer
 import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutor, Future}
 import com.digitalasset.canton.data.CantonTimestamp
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.{
+  DsoRules_CloseVoteRequestResult,
+  VoteRequest,
+}
+import io.grpc.Status
 
 /** Connection to the admin API of CC Scan. This is used by other apps
   * to query for the DSO party id.
@@ -121,6 +128,33 @@ class SingleScanConnection private[client] (
       HttpScanAppClient.GetAmuletRules(cachedAmuletRules),
     )
   }
+
+  override def getDsoRules(
+  )(implicit
+      tc: TraceContext
+  ): Future[Contract[DsoRules.ContractId, DsoRules]] = {
+    runHttpCmd(
+      config.adminApi.url,
+      HttpScanAppClient.GetDsoInfo(headers = List()),
+    ).map { dsoInfo =>
+      Contract
+        .fromHttp(DsoRules.COMPANION)(dsoInfo.dsoRules.contract)
+        .valueOr(err =>
+          throw Status.INVALID_ARGUMENT
+            .withDescription(s"Failed to decode dso rules: $err")
+            .asRuntimeException
+        )
+    }
+  }
+
+  override def listVoteRequests()(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[Seq[Contract[VoteRequest.ContractId, VoteRequest]]] =
+    runHttpCmd(
+      config.adminApi.url,
+      HttpScanAppClient.ListDsoRulesVoteRequests(),
+    )
 
   override def getExternalPartyAmuletRules()(implicit
       ec: ExecutionContext,
@@ -257,7 +291,7 @@ class SingleScanConnection private[client] (
     ).map(_.map { scans =>
       if (scans.malformed.nonEmpty) {
         logger.warn(
-          s"Malformed scans found for domain ${scans.domainId}: ${scans.malformed.keys}. This likely indicates malicious SVs."
+          s"Malformed scans found for domain ${scans.synchronizerId}: ${scans.malformed.keys}. This likely indicates malicious SVs."
         )
       }
       scans
@@ -418,23 +452,23 @@ class SingleScanConnection private[client] (
       )
     )
 
-  def getSynchronizerIdentities(domainIdPrefix: String)(implicit
+  def getSynchronizerIdentities(synchronizerIdPrefix: String)(implicit
       ec: ExecutionContext,
       tc: TraceContext,
   ): Future[HttpScanSoftDomainMigrationPocAppClient.SynchronizerIdentities] =
     runHttpCmd(
       config.adminApi.url,
-      HttpScanSoftDomainMigrationPocAppClient.GetSynchronizerIdentities(domainIdPrefix),
+      HttpScanSoftDomainMigrationPocAppClient.GetSynchronizerIdentities(synchronizerIdPrefix),
     )
 
-  def getSynchronizerBootstrappingTransactions(domainIdPrefix: String)(implicit
+  def getSynchronizerBootstrappingTransactions(synchronizerIdPrefix: String)(implicit
       ec: ExecutionContext,
       tc: TraceContext,
   ): Future[HttpScanSoftDomainMigrationPocAppClient.SynchronizerBootstrappingTransactions] =
     runHttpCmd(
       config.adminApi.url,
       HttpScanSoftDomainMigrationPocAppClient.GetSynchronizerBootstrappingTransactions(
-        domainIdPrefix
+        synchronizerIdPrefix
       ),
     )
 
@@ -477,21 +511,73 @@ class SingleScanConnection private[client] (
 
   override def getUpdatesBefore(
       migrationId: Long,
-      domainId: DomainId,
+      synchronizerId: SynchronizerId,
       before: CantonTimestamp,
       atOrAfter: Option[CantonTimestamp],
       count: Int,
-  )(implicit tc: TraceContext): Future[Seq[LedgerClient.GetTreeUpdatesResponse]] =
+  )(implicit tc: TraceContext): Future[Seq[UpdateHistoryResponse]] =
     runHttpCmd(
       config.adminApi.url,
       HttpScanAppClient.GetUpdatesBefore(
         migrationId,
-        domainId,
+        synchronizerId,
         before,
         atOrAfter,
         count,
       ),
     )
+
+  override def listDsoRulesVoteRequests()(implicit
+      tc: TraceContext,
+      ec: ExecutionContext,
+  ): Future[Seq[Contract[VoteRequest.ContractId, VoteRequest]]] = ???
+
+  override def listVoteRequestResults(
+      actionName: Option[String],
+      accepted: Option[Boolean],
+      requester: Option[String],
+      effectiveFrom: Option[String],
+      effectiveTo: Option[String],
+      limit: Int,
+  )(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[Seq[DsoRules_CloseVoteRequestResult]] = runHttpCmd(
+    config.adminApi.url,
+    HttpScanAppClient.ListVoteRequestResults(
+      actionName,
+      accepted,
+      requester,
+      effectiveFrom,
+      effectiveTo,
+      limit,
+    ),
+  )
+
+  override def listVoteRequestsByTrackingCid(
+      voteRequestCids: Seq[VoteRequest.ContractId]
+  )(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[
+    Seq[Contract[VoteRequest.ContractId, VoteRequest]]
+  ] = runHttpCmd(
+    config.adminApi.url,
+    HttpScanAppClient.ListVoteRequestsByTrackingCid(
+      voteRequestCids
+    ),
+  )
+
+  override def lookupVoteRequest(contractId: VoteRequest.ContractId)(implicit
+      ec: ExecutionContext,
+      tc: TraceContext,
+  ): Future[Option[Contract[VoteRequest.ContractId, VoteRequest]]] = runHttpCmd(
+    config.adminApi.url,
+    HttpScanAppClient.LookupVoteRequest(
+      contractId
+    ),
+  )
+
 }
 
 object SingleScanConnection {

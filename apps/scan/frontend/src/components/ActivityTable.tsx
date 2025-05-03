@@ -1,7 +1,6 @@
 // Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 import * as React from 'react';
-import BigNumber from 'bignumber.js';
 import {
   AmountDisplay,
   AnsEntry,
@@ -9,8 +8,11 @@ import {
   Loading,
   RateDisplay,
   TitledTable,
-} from 'common-frontend';
-import { useActivity } from 'common-frontend/scan-api';
+  UpdateId,
+  updateIdFromEventId,
+} from '@lfdecentralizedtrust/splice-common-frontend';
+import { useActivity } from '@lfdecentralizedtrust/splice-common-frontend/scan-api';
+import BigNumber from 'bignumber.js';
 import { useEffect } from 'react';
 import { useInView } from 'react-intersection-observer';
 import { ListActivityResponseItem, SenderAmount, Transfer, AmuletAmount } from 'scan-openapi';
@@ -74,6 +76,7 @@ export const ActivityTable: React.FC = () => {
               <TableCell align="right">Rewards Created</TableCell>
               <TableCell align="right">Total Fees Burnt</TableCell>
               <TableCell align="right">Price</TableCell>
+              <TableCell align="right">Update ID</TableCell>
             </TableRow>
           </TableHead>
 
@@ -287,6 +290,9 @@ const ActivityRow: React.FC<ActivityRowProps> = ({ activity }) => {
       </TableCell>
       <TableCell align="right">
         <RateDisplay base="AmuletUnit" quote="USDUnit" amuletPrice={activity.amuletPrice} />
+      </TableCell>
+      <TableCell>
+        <UpdateId updateId={updateIdFromEventId(activity.eventId)} />
       </TableCell>
     </TableRow>
   );

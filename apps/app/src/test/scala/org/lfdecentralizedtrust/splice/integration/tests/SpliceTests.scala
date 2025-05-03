@@ -11,10 +11,15 @@ import com.digitalasset.canton.BaseTest
 import com.digitalasset.canton.admin.api.client.commands.GrpcAdminCommand
 import com.digitalasset.canton.concurrent.{FutureSupervisor, Threading}
 import com.digitalasset.canton.config.{
+  CantonEdition,
+  CommunityCantonEdition,
   NonNegativeDuration,
   NonNegativeFiniteDuration,
   ProcessingTimeout,
 }
+import com.digitalasset.canton.environment.EnvironmentFactory
+
+import java.time.Duration
 import com.digitalasset.canton.integration.*
 import com.digitalasset.canton.logging.NamedLoggerFactory
 import com.digitalasset.canton.networking.grpc.GrpcError
@@ -32,13 +37,18 @@ import org.apache.pekko.actor.{ActorSystem, CoordinatedShutdown}
 import org.apache.pekko.http.scaladsl.Http
 import org.lfdecentralizedtrust.splice.admin.api.client.{DamlGrpcClientMetrics, GrpcClientMetrics}
 import org.lfdecentralizedtrust.splice.auth.AuthUtil
-import org.lfdecentralizedtrust.splice.config.AuthTokenSourceConfig
+import org.lfdecentralizedtrust.splice.config.{AuthTokenSourceConfig, SpliceConfig}
 import org.lfdecentralizedtrust.splice.console.*
-import org.lfdecentralizedtrust.splice.environment.{EnvironmentImpl, RetryProvider}
+import org.lfdecentralizedtrust.splice.environment.{
+  RetryProvider,
+  SpliceEnvironment,
+  SpliceEnvironmentFactory,
+}
 import org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition
 import org.lfdecentralizedtrust.splice.integration.plugins.{
   ResetDecentralizedNamespace,
-  ResetSequencerDomainStateThreshold,
+  ResetSequencerSynchronizerStateThreshold,
+  TokenStandardCliSanityCheckPlugin,
   UpdateHistorySanityCheckPlugin,
   WaitForPorts,
 }
@@ -113,17 +123,25 @@ object SpliceTests extends LazyLogging {
         .openTelemetry
     } else OpenTelemetry.noop()
 
-  type SpliceTestConsoleEnvironment = TestConsoleEnvironment[EnvironmentImpl]
+  type SpliceTestConsoleEnvironment = TestConsoleEnvironment[SpliceConfig, SpliceEnvironment]
   type SharedSpliceEnvironment =
-    SharedEnvironment[EnvironmentImpl, SpliceTestConsoleEnvironment]
+    SharedEnvironment[SpliceConfig, SpliceEnvironment]
   type IsolatedSpliceEnvironments =
-    IsolatedEnvironments[EnvironmentImpl, SpliceTestConsoleEnvironment]
+    IsolatedEnvironments[SpliceConfig, SpliceEnvironment]
 
   trait IntegrationTest
-      extends BaseIntegrationTest[EnvironmentImpl, SpliceTestConsoleEnvironment]
+      extends BaseIntegrationTest[SpliceConfig, SpliceEnvironment]
       with IsolatedSpliceEnvironments
       with TestCommon
       with LedgerApiExtensions {
+
+    override def environmentFactory: EnvironmentFactory[SpliceConfig, SpliceEnvironment] =
+      SpliceEnvironmentFactory
+
+    override val edition: CantonEdition = CommunityCantonEdition
+
+    type SpliceEnvironmentDefinition =
+      BaseEnvironmentDefinition[SpliceConfig, SpliceEnvironment]
 
     override lazy val testInfrastructureMetricsFactory: LabeledMetricsFactory = {
       new OpenTelemetryMetricsFactory(
@@ -138,49 +156,75 @@ object SpliceTests extends LazyLogging {
 
     protected lazy val resetRequiredTopologyState: Boolean = true
 
-    protected def runUpdateHistorySanityCheck: Boolean = true
-    protected lazy val updateHistoryIgnoredRootCreates: Seq[Identifier] = Seq.empty
-    protected lazy val updateHistoryIgnoredRootExercises: Seq[(Identifier, String)] = Seq.empty
+    /** Note that `durationUntilOffboardingEffectivity` is set to 20 seconds to allow quick offboarding in our tests.
+      *        The default duration that should be used in our offboarding process is 3 hours.
+      */
+    protected val durationUntilOffboardingEffectivity: Duration = Duration.ofSeconds(20)
+    protected val durationUntilExpiration: Duration =
+      durationUntilOffboardingEffectivity.minusSeconds(1)
 
+    protected def runUpdateHistorySanityCheck: Boolean = true
+    protected lazy val sanityChecksIgnoredRootCreates: Seq[Identifier] = Seq.empty
+    protected lazy val sanityChecksIgnoredRootExercises: Seq[(Identifier, String)] = Seq.empty
     if (runUpdateHistorySanityCheck) {
       registerPlugin(
         new UpdateHistorySanityCheckPlugin(
-          updateHistoryIgnoredRootCreates,
-          updateHistoryIgnoredRootExercises,
+          sanityChecksIgnoredRootCreates,
+          sanityChecksIgnoredRootExercises,
           loggerFactory,
         )
       )
     }
+
+    protected def runTokenStandardCliSanityCheck: Boolean = true
+    protected lazy val tokenStandardCliBehavior
+        : TokenStandardCliSanityCheckPlugin.OutputCreateArchiveBehavior =
+      TokenStandardCliSanityCheckPlugin.OutputCreateArchiveBehavior.IgnoreForTemplateIds(
+        sanityChecksIgnoredRootCreates ++ sanityChecksIgnoredRootExercises.map(_._1)
+      )
+    if (runTokenStandardCliSanityCheck) {
+      registerPlugin(
+        new TokenStandardCliSanityCheckPlugin(tokenStandardCliBehavior, loggerFactory)
+      )
+    }
+
     registerPlugin(new WaitForPorts(extraPortsToWaitFor))
+
     if (resetRequiredTopologyState) {
       registerPlugin(new ResetDecentralizedNamespace())
       // We MUST have the decentralized namespace reset before the reset of the sequencer domain state since
       // the latter expects that submitting the topology tx from only sv1 will succeed.
-      registerPlugin(new ResetSequencerDomainStateThreshold())
+      registerPlugin(new ResetSequencerSynchronizerStateThreshold())
     }
 
-    override def environmentDefinition
-        : BaseEnvironmentDefinition[EnvironmentImpl, SpliceTestConsoleEnvironment] =
+    override def environmentDefinition: BaseEnvironmentDefinition[SpliceConfig, SpliceEnvironment] =
       EnvironmentDefinition
         .simpleTopology1Sv(this.getClass.getSimpleName)
   }
 
   trait IntegrationTestWithSharedEnvironment
-      extends BaseIntegrationTest[EnvironmentImpl, SpliceTestConsoleEnvironment]
+      extends BaseIntegrationTest[SpliceConfig, SpliceEnvironment]
       with SharedSpliceEnvironment
       with BeforeAndAfterEach
       with TestCommon
       with LedgerApiExtensions {
 
-    protected def runUpdateHistorySanityCheck: Boolean = true
-    protected lazy val updateHistoryIgnoredRootCreates: Seq[Identifier] = Seq.empty
-    protected lazy val updateHistoryIgnoredRootExercises: Seq[(Identifier, String)] = Seq.empty
+    override def environmentFactory: EnvironmentFactory[SpliceConfig, SpliceEnvironment] =
+      SpliceEnvironmentFactory
 
+    override val edition: CantonEdition = CommunityCantonEdition
+
+    type SpliceEnvironmentDefinition =
+      BaseEnvironmentDefinition[SpliceConfig, SpliceEnvironment]
+
+    protected def runUpdateHistorySanityCheck: Boolean = true
+    protected lazy val sanityChecksIgnoredRootCreates: Seq[Identifier] = Seq.empty
+    protected lazy val sanityChecksIgnoredRootExercises: Seq[(Identifier, String)] = Seq.empty
     if (runUpdateHistorySanityCheck) {
       registerPlugin(
         new UpdateHistorySanityCheckPlugin(
-          updateHistoryIgnoredRootCreates,
-          updateHistoryIgnoredRootExercises,
+          sanityChecksIgnoredRootCreates,
+          sanityChecksIgnoredRootExercises,
           loggerFactory,
         )
       )
@@ -202,15 +246,27 @@ object SpliceTests extends LazyLogging {
     protected lazy val resetRequiredTopologyState: Boolean = true
 
     registerPlugin(new WaitForPorts(extraPortsToWaitFor))
+
+    protected def runTokenStandardCliSanityCheck: Boolean = true
+    protected lazy val tokenStandardCliBehavior
+        : TokenStandardCliSanityCheckPlugin.OutputCreateArchiveBehavior =
+      TokenStandardCliSanityCheckPlugin.OutputCreateArchiveBehavior.IgnoreForTemplateIds(
+        sanityChecksIgnoredRootCreates ++ sanityChecksIgnoredRootExercises.map(_._1)
+      )
+    if (runTokenStandardCliSanityCheck) {
+      registerPlugin(
+        new TokenStandardCliSanityCheckPlugin(tokenStandardCliBehavior, loggerFactory)
+      )
+    }
+
     if (resetRequiredTopologyState) {
       // We MUST have the decentralized namespace reset before the reset of the sequencer domain state since
       // the latter expects that submitting the topology tx from only sv1 will succeed.
       registerPlugin(new ResetDecentralizedNamespace())
-      registerPlugin(new ResetSequencerDomainStateThreshold())
+      registerPlugin(new ResetSequencerSynchronizerStateThreshold())
     }
 
-    override def environmentDefinition
-        : BaseEnvironmentDefinition[EnvironmentImpl, SpliceTestConsoleEnvironment] =
+    override def environmentDefinition: BaseEnvironmentDefinition[SpliceConfig, SpliceEnvironment] =
       EnvironmentDefinition
         .simpleTopology1Sv(this.getClass.getSimpleName)
 
@@ -476,16 +532,16 @@ object SpliceTests extends LazyLogging {
     def withCommandRetryPolicy[T](
         policy: GrpcAdminCommand[?, ?, ?] => GrpcError => Boolean
     )(block: => T)(implicit env: SpliceTestConsoleEnvironment): T = {
-      val prevD = env.grpcDomainCommandRunner.retryPolicy
+      val prevD = env.grpcSequencerCommandRunner.retryPolicy
       val prevL = env.grpcLedgerCommandRunner.retryPolicy
       val prevA = env.grpcAdminCommandRunner.retryPolicy
       try {
-        env.grpcDomainCommandRunner.setRetryPolicy(policy)
+        env.grpcSequencerCommandRunner.setRetryPolicy(policy)
         env.grpcLedgerCommandRunner.setRetryPolicy(policy)
         env.grpcAdminCommandRunner.setRetryPolicy(policy)
         block
       } finally {
-        env.grpcDomainCommandRunner.setRetryPolicy(prevD)
+        env.grpcSequencerCommandRunner.setRetryPolicy(prevD)
         env.grpcLedgerCommandRunner.setRetryPolicy(prevL)
         env.grpcAdminCommandRunner.setRetryPolicy(prevA)
       }
@@ -506,7 +562,7 @@ object SpliceTests extends LazyLogging {
     }
 
     def registerHttpConnectionPoolsCleanup(implicit
-        env: TestEnvironment[EnvironmentImpl]
+        env: TestEnvironment[SpliceConfig]
     ): Unit = {
       implicit val sys = env.actorSystem
       implicit val ec = env.executionContext

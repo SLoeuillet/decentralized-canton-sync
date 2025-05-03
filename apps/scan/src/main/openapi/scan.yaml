@@ -834,6 +834,20 @@ paths:
         "404":
           $ref: "../../../../common/src/main/openapi/common-external.yaml#/components/responses/404"
 
+  /v0/amulet-price/votes:
+    get:
+      tags: [scan, internal]
+      x-jvm-package: scan
+      operationId: "listAmuletPriceVotes"
+      description: Retrieve a list of the latest amulet price votes
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                "$ref": "../../../../common/src/main/openapi/common-internal.yaml#/components/schemas/ListAmuletPriceVotesResponse"
+
   /v0/voterequest:
     post:
       tags: [internal, scan]
@@ -1390,6 +1404,21 @@ paths:
           $ref: "../../../../common/src/main/openapi/common-external.yaml#/components/responses/400"
         "404":
           $ref: "../../../../common/src/main/openapi/common-external.yaml#/components/responses/404"
+        "500":
+          $ref: "../../../../common/src/main/openapi/common-external.yaml#/components/responses/500"
+
+  /v0/feature-support:
+    get:
+      tags: [internal,scan]
+      x-jvm-package: scan
+      operationId: "featureSupport"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "../../../../common/src/main/openapi/common-internal.yaml#/components/schemas/FeatureSupportResponse"
         "500":
           $ref: "../../../../common/src/main/openapi/common-external.yaml#/components/responses/500"
 

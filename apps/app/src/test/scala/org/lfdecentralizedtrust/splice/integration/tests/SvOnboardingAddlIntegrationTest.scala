@@ -24,7 +24,8 @@ class SvOnboardingAddlIntegrationTest
     with WalletTestUtil
     with SvTestUtil {
 
-  override def environmentDefinition =
+  override def environmentDefinition
+      : org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition =
     super.environmentDefinition
       .addConfigTransform((_, config) =>
         ConfigTransforms.updateAllSvAppConfigs { (name, config) =>
@@ -38,7 +39,7 @@ class SvOnboardingAddlIntegrationTest
         }(config)
       )
 
-  override lazy val updateHistoryIgnoredRootCreates = Seq(
+  override lazy val sanityChecksIgnoredRootCreates = Seq(
     amuletCodegen.Amulet.TEMPLATE_ID_WITH_PACKAGE_ID
   )
 
@@ -189,7 +190,7 @@ class SvOnboardingAddlIntegrationTest
       forAll(Seq(sv1Backend, sv2Backend, sv3Backend, sv4Backend)) { svBackend =>
         val svParty = svBackend.getDsoInfo().svParty
         val decentralizedSynchronizer = svBackend.config.domains.global.alias
-        val sequencerConnections = svBackend.participantClient.domains
+        val sequencerConnections = svBackend.participantClient.synchronizers
           .config(decentralizedSynchronizer)
           .value
           .sequencerConnections
@@ -238,7 +239,7 @@ class SvOnboardingAddlIntegrationTest
       val (sv2Party, _) = actAndCheck(
         "allocate sv2 party",
         sv2Backend.participantClientWithAdminToken.ledger_api.parties
-          .allocate(sv2Backend.config.ledgerApiUser, sv2Backend.config.ledgerApiUser)
+          .allocate(sv2Backend.config.ledgerApiUser)
           .party,
       )(
         "sv1 sees sv2 party",
@@ -384,29 +385,38 @@ class SvOnboardingAddlIntegrationTest
             }
           },
           lines => {
-            forAll(lines)(line =>
-              line.message should
-                include(
-                  "Unexpected amulet create event"
-                )
-            )
+            forAll(lines)(line => line.message should include("Unexpected amulet create event"))
             // Error emitted by every ScanTxLogParser plus the one UserWalletTxLogParser
             // associated with the owner of the coin.
             lines should have size 2
+            forExactly(1, lines)(line => line.loggerName should include("sv1Scan"))
+            forExactly(1, lines)(line => line.loggerName should include("sv1Validator"))
           },
         )
       }
 
-      startAllSync(
-        sv2ScanBackend,
-        sv2Backend,
-        sv2ValidatorBackend,
-      )
+      clue("Start SV2") {
+        loggerFactory.assertEventuallyLogsSeq(SuppressionRule.Level(Level.ERROR))(
+          startAllSync(
+            sv2ScanBackend,
+            sv2Backend,
+            sv2ValidatorBackend,
+          ),
+          lines => {
+            forAll(lines)(line => line.message should include("Unexpected amulet create event"))
+            // Similar to above, but this time due to TxLogBackfillingTrigger backfilling entries.
+            // Only scan processes the coin owned by sv1UserParty.
+            lines should have size 1
+            forExactly(1, lines)(line => line.loggerName should include("sv2Scan"))
+          },
+          timeUntilSuccess = 60.seconds,
+        )
+      }
       sv1Backend.getDsoInfo().dsoRules.payload.svs should have size 2
 
       inside(
         sv1Backend.participantClientWithAdminToken.topology.party_to_participant_mappings.list(
-          domain = decentralizedSynchronizerId,
+          synchronizerId = decentralizedSynchronizerId,
           filterParty = dsoParty.toProtoPrimitive,
         )
       ) { case Seq(mapping) =>
@@ -429,7 +439,7 @@ class SvOnboardingAddlIntegrationTest
             _.errorMessage should (include(
               s"INVALID_ARGUMENT/An error occurred. Please contact the operator and inquire about the request"
             ) or include(
-              s"Not connected to a domain on which this participant can submit for all submitters"
+              s"NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT"
             )),
           )
         }

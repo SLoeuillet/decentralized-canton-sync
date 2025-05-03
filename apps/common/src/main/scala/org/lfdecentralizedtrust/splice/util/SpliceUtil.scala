@@ -10,8 +10,8 @@ import org.lfdecentralizedtrust.splice.codegen.java.splice
 import org.lfdecentralizedtrust.splice.codegen.java.splice.types.Round
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amulet.Amulet
 import org.lfdecentralizedtrust.splice.codegen.java.splice.decentralizedsynchronizer.{
-  BaseRateTrafficLimits,
   AmuletDecentralizedSynchronizerConfig,
+  BaseRateTrafficLimits,
   SynchronizerFeesConfig,
 }
 import org.lfdecentralizedtrust.splice.codegen.java.splice.issuance.IssuanceConfig
@@ -20,21 +20,30 @@ import org.lfdecentralizedtrust.splice.codegen.java.da.time.types.RelTime
 import org.lfdecentralizedtrust.splice.codegen.java.da.types.Tuple2
 import org.lfdecentralizedtrust.splice.codegen.java.da.set.types.Set as DamlSet
 import org.lfdecentralizedtrust.splice.environment.{
-  SpliceLedgerConnection,
   CommandPriority,
   DarResource,
   DarResources,
   RetryProvider,
+  SpliceLedgerConnection,
 }
 import org.lfdecentralizedtrust.splice.store.MultiDomainAcsStore.QueryResult
 import com.digitalasset.canton.config.NonNegativeFiniteDuration
 import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.logging.TracedLogger
-import com.digitalasset.canton.topology.{DomainId, PartyId}
+import com.digitalasset.canton.topology.{SynchronizerId, PartyId}
 import com.digitalasset.canton.tracing.TraceContext
+import org.lfdecentralizedtrust.splice.codegen.java.splice.cometbft.CometBftConfigLimits
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dso.decentralizedsynchronizer.{
+  DsoDecentralizedSynchronizerConfig,
+  SynchronizerConfig,
+  SynchronizerNodeConfigLimits,
+}
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.DsoRulesConfig
+import org.lfdecentralizedtrust.splice.codegen.java.splice.dso
 
 import java.math.RoundingMode
 import java.time.{Duration, Instant}
+import java.util.Optional
 import java.util.concurrent.TimeUnit
 import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters.*
@@ -104,7 +113,7 @@ object SpliceUtil {
       user: PartyId,
       logger: TracedLogger,
       connection: SpliceLedgerConnection,
-      domainId: DomainId,
+      synchronizerId: SynchronizerId,
       retryProvider: RetryProvider,
       lookupValidatorRightByParty: (
           PartyId
@@ -137,7 +146,7 @@ object SpliceUtil {
                 ),
               deduplicationOffset = offset,
             )
-            .withDomainId(domainId)
+            .withSynchronizerId(synchronizerId)
             .yieldUnit()
         case QueryResult(_, Some(_)) =>
           logger.info(s"ValidatorRight for $user already exists, skipping")
@@ -235,11 +244,11 @@ object SpliceUtil {
   private val dummyReadVsWriteScalingFactor = 4
 
   // TODO(tech-debt) revisit naming here. "default" and "initial" are two things that are no longer accurate (these are used for other things as well), and consider adding more default values to methods here
-
+  // TODO(#16139) get rid of this method
   def defaultAmuletConfigSchedule(
       initialTickDuration: NonNegativeFiniteDuration,
       initialMaxNumInputs: Int,
-      initialDomainId: DomainId,
+      initialSynchronizerId: SynchronizerId,
       initialExtraTrafficPrice: BigDecimal = dummyExtraTrafficPrice,
       initialMinTopupAmount: Long = dummyMinTopupAmount,
       initialBaseRateBurstAmount: Long = dummyBaseRateBurstAmount,
@@ -254,7 +263,7 @@ object SpliceUtil {
     defaultAmuletConfig(
       initialTickDuration,
       initialMaxNumInputs,
-      initialDomainId,
+      initialSynchronizerId,
       initialExtraTrafficPrice,
       initialMinTopupAmount,
       initialBaseRateBurstAmount,
@@ -272,10 +281,48 @@ object SpliceUtil {
   // Roughly equal to $1/year expressed as a daily rate.
   lazy val defaultTransferPreapprovalFee = damlDecimal(0.00274)
 
+  def defaultDsoRulesConfig(
+      numUnclaimedRewardsThreshold: Int,
+      numMemberTrafficContractsThreshold: Int,
+      maxNumCometBftNodes: Int,
+      dummyDomain: SynchronizerId,
+  ): DsoRulesConfig = new DsoRulesConfig(
+    numUnclaimedRewardsThreshold, // numUnclaimedRewardsThreshold
+    numMemberTrafficContractsThreshold, // numMemberTrafficContractsThreshold, arbitrarily set as 5 for now.
+    new RelTime(TimeUnit.HOURS.toMicros(1)), // actionConfirmationTimeout
+    new RelTime(TimeUnit.HOURS.toMicros(1)), // svOnboardingRequestTimeout
+    new RelTime(TimeUnit.HOURS.toMicros(1)), // svOnboardingConfirmedTimeout
+    new RelTime(TimeUnit.HOURS.toMicros(7 * 24)), // voteRequestTimeout
+    new RelTime(TimeUnit.SECONDS.toMicros(70)), // dsoDelegateInactiveTimeout
+    new SynchronizerNodeConfigLimits(
+      new CometBftConfigLimits(
+        maxNumCometBftNodes, // maxNumCometBftNodes
+        2, // maxNumGovernanceKeys
+        2, // maxNumSequencingKeys
+        50, // maxNodeIdLength
+        256, // maxPubKeyLength
+      )
+    ),
+    1024, // maxTextLength
+    new DsoDecentralizedSynchronizerConfig(
+      // domains
+      Map(
+        dummyDomain.toProtoPrimitive -> new SynchronizerConfig(
+          dso.decentralizedsynchronizer.SynchronizerState.DS_OPERATIONAL,
+          "TODO(#4900): share CometBFT genesis.json of sv1 via DsoRules config.",
+          Optional.empty(),
+        )
+      ).asJava,
+      dummyDomain.toProtoPrimitive, // lastDomainId
+      dummyDomain.toProtoPrimitive, // activeSynchronizer
+    ), // decentralizedSynchronizerConfig
+    Optional.empty(), // nextScheduledHardDomainMigration
+  )
+
   def defaultAmuletConfig(
       initialTickDuration: NonNegativeFiniteDuration,
       initialMaxNumInputs: Int,
-      initialDomainId: DomainId,
+      initialSynchronizerId: SynchronizerId,
       initialExtraTrafficPrice: BigDecimal = dummyExtraTrafficPrice,
       initialMinTopupAmount: Long = dummyMinTopupAmount,
       initialBaseRateBurstAmount: Long = dummyBaseRateBurstAmount,
@@ -284,7 +331,8 @@ object SpliceUtil {
       initialPackageConfig: splice.amuletconfig.PackageConfig = readPackageConfig(),
       holdingFee: BigDecimal = defaultHoldingFee.rate,
       transferPreapprovalFee: Option[BigDecimal] = None,
-      nextDomainId: Option[DomainId] = None,
+      featuredAppActivityMarkerAmount: Option[BigDecimal] = None,
+      nextSynchronizerId: Option[SynchronizerId] = None,
   ): splice.amuletconfig.AmuletConfig[splice.amuletconfig.USD] =
     new splice.amuletconfig.AmuletConfig(
       // transferConfig
@@ -295,8 +343,8 @@ object SpliceUtil {
 
       // global domain config
       defaultDecentralizedSynchronizerConfig(
-        initialDomainId,
-        nextDomainId,
+        initialSynchronizerId,
+        nextSynchronizerId,
         initialExtraTrafficPrice,
         initialMinTopupAmount,
         initialBaseRateBurstAmount,
@@ -308,6 +356,7 @@ object SpliceUtil {
       new RelTime(TimeUnit.NANOSECONDS.toMicros(initialTickDuration.duration.toNanos)),
       initialPackageConfig,
       transferPreapprovalFee.map(_.bigDecimal).toJava,
+      featuredAppActivityMarkerAmount.map(_.bigDecimal).toJava,
     )
 
   def defaultAnsConfig(
@@ -333,25 +382,25 @@ object SpliceUtil {
   )
 
   private def defaultDecentralizedSynchronizerConfig(
-      initialDomainId: DomainId,
-      nextDomainId: Option[DomainId],
+      initialSynchronizerId: SynchronizerId,
+      nextSynchronizerId: Option[SynchronizerId],
       initialExtraTrafficPrice: BigDecimal,
       initialMinTopupAmount: Long,
       initialBaseRateBurstAmount: Long,
       initialBaseRateBurstWindow: NonNegativeFiniteDuration,
       initialReadVsWriteScalingFactor: Int,
   ): AmuletDecentralizedSynchronizerConfig = {
-    val domainId = initialDomainId.toProtoPrimitive
-    val next = nextDomainId.map(_.toProtoPrimitive)
+    val synchronizerId = initialSynchronizerId.toProtoPrimitive
+    val next = nextSynchronizerId.map(_.toProtoPrimitive)
     new AmuletDecentralizedSynchronizerConfig(
       // requiredSynchronizers
       new DamlSet(
-        (Map(domainId -> DamlUnit.getInstance) ++ next
+        (Map(synchronizerId -> DamlUnit.getInstance) ++ next
           .map(_ -> DamlUnit.getInstance)
           .toList).asJava
       ),
       // activeSynchronizer
-      next getOrElse domainId,
+      next getOrElse synchronizerId,
       // fees
       domainFeesConfig(
         baseRateBurstAmount = initialBaseRateBurstAmount,

@@ -3,6 +3,7 @@
 
 package org.lfdecentralizedtrust.splice.scan.store
 
+import com.daml.ledger.javaapi.data.codegen.ContractId
 import com.digitalasset.daml.lf.data.Time.Timestamp
 import org.lfdecentralizedtrust.splice.codegen.java.splice
 import org.lfdecentralizedtrust.splice.environment.{PackageIdResolver, RetryProvider}
@@ -15,6 +16,7 @@ import org.lfdecentralizedtrust.splice.store.{
   MultiDomainAcsStore,
   PageLimit,
   SortOrder,
+  TxLogAppStore,
   VotesStore,
 }
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amulet.FeaturedAppRight
@@ -39,9 +41,10 @@ import com.digitalasset.canton.lifecycle.CloseContext
 import com.digitalasset.canton.logging.NamedLoggerFactory
 import com.digitalasset.canton.logging.pretty.{Pretty, PrettyPrinting}
 import com.digitalasset.canton.resource.{DbStorage, Storage}
-import com.digitalasset.canton.topology.{DomainId, Member, ParticipantId, PartyId}
+import com.digitalasset.canton.topology.{SynchronizerId, Member, ParticipantId, PartyId}
 import com.digitalasset.canton.tracing.TraceContext
 import io.grpc.Status
+import org.lfdecentralizedtrust.splice.store.MultiDomainAcsStore.ContractCompanion
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters.*
@@ -50,9 +53,9 @@ import java.time.Instant
 
 final case class ScanInfo(publicUrl: String, svName: String)
 
-/** Utility class grouping the two kinds of stores managed by the DsoApp. */
 trait ScanStore
     extends AppStore
+    with TxLogAppStore[TxLogEntry]
     with PackageIdResolver.HasAmuletRules
     with DsoRulesStore
     with MiningRoundsStore
@@ -94,7 +97,7 @@ trait ScanStore
       )
     )
 
-  /** Returns all items extracted by `f` from the DsoRules ensuring that they're sorted by domainId,
+  /** Returns all items extracted by `f` from the DsoRules ensuring that they're sorted by synchronizerId,
     * so that the order is deterministic.
     */
   def listFromSvNodeStates[T](
@@ -115,9 +118,9 @@ trait ScanStore
   def listDsoScans()(implicit tc: TraceContext): Future[Vector[(String, Vector[ScanInfo])]] = {
     listFromSvNodeStates { nodeState =>
       for {
-        (domainId, domainConfig) <- nodeState.state.synchronizerNodes.asScala.toVector
+        (synchronizerId, domainConfig) <- nodeState.state.synchronizerNodes.asScala.toVector
         scan <- domainConfig.scan.toScala
-      } yield domainId -> ScanInfo(scan.publicUrl, nodeState.svName)
+      } yield synchronizerId -> ScanInfo(scan.publicUrl, nodeState.svName)
     }
   }
   def getAmuletRules()(implicit
@@ -134,7 +137,7 @@ trait ScanStore
 
   def getDecentralizedSynchronizerId()(implicit
       tc: TraceContext
-  ): Future[DomainId] =
+  ): Future[SynchronizerId] =
     getAmuletRulesWithState()
       .flatMap(
         _.state.fold(
@@ -215,11 +218,11 @@ trait ScanStore
         .baseRateTrafficLimits
     )
 
-  def getTotalPurchasedMemberTraffic(memberId: Member, domainId: DomainId)(implicit
+  def getTotalPurchasedMemberTraffic(memberId: Member, synchronizerId: SynchronizerId)(implicit
       tc: TraceContext
   ): Future[Long]
 
-  def findFeaturedAppRight(providerPartyId: PartyId)(implicit
+  def lookupFeaturedAppRight(providerPartyId: PartyId)(implicit
       tc: TraceContext
   ): Future[Option[ContractWithState[FeaturedAppRight.ContractId, FeaturedAppRight]]]
 
@@ -281,6 +284,14 @@ trait ScanStore
   )(implicit
       tc: TraceContext
   ): Future[Map[TransferCommand.ContractId, TransferCommandTxLogEntry]]
+
+  def lookupContractByRecordTime[C, TCId <: ContractId[_], T](
+      companion: C,
+      recordTime: CantonTimestamp = CantonTimestamp.MinValue,
+  )(implicit
+      companionClass: ContractCompanion[C, TCId, T],
+      tc: TraceContext,
+  ): Future[Option[Contract[TCId, T]]]
 }
 
 object ScanStore {
@@ -419,7 +430,8 @@ object ScanStore {
                 _ => None,
                 Some(_),
               ),
-            memberTrafficDomain = Some(DomainId.tryFromString(contract.payload.synchronizerId)),
+            memberTrafficDomain =
+              Some(SynchronizerId.tryFromString(contract.payload.synchronizerId)),
             totalTrafficPurchased = Some(contract.payload.totalPurchased),
           )
         },
@@ -439,6 +451,12 @@ object ScanStore {
             ScanAcsStoreRowData(
               contract,
               svParty = Some(PartyId.tryFromProtoPrimitive(contract.payload.sv)),
+            )
+        },
+        mkFilter(splice.dso.amuletprice.AmuletPriceVote.COMPANION)(co => co.payload.dso == dso) {
+          contract =>
+            ScanAcsStoreRowData(
+              contract
             )
         },
         mkFilter(splice.dsorules.VoteRequest.COMPANION)(co => co.payload.dso == dso) { contract =>
@@ -473,6 +491,24 @@ object ScanStore {
           ScanAcsStoreRowData(
             contract,
             walletParty = Some(PartyId.tryFromProtoPrimitive(contract.payload.sender)),
+          )
+        },
+        mkFilter(splice.amuletallocation.AmuletAllocation.COMPANION)(co =>
+          co.payload.allocation.transferLeg.instrumentId.admin == dso
+        ) { contract =>
+          ScanAcsStoreRowData(
+            contract = contract,
+            contractExpiresAt =
+              Some(Timestamp.assertFromInstant(contract.payload.allocation.settlement.settleBefore)),
+          )
+        },
+        mkFilter(splice.amulettransferinstruction.AmuletTransferInstruction.COMPANION)(co =>
+          co.payload.transfer.instrumentId.admin == dso
+        ) { contract =>
+          ScanAcsStoreRowData(
+            contract = contract,
+            contractExpiresAt =
+              Some(Timestamp.assertFromInstant(contract.payload.transfer.executeBefore)),
           )
         },
       ),

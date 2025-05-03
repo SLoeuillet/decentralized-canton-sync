@@ -8,7 +8,7 @@ import {
 import { ContractId, emptyMap } from '@daml/types';
 
 import { Contract } from '../../../utils';
-import { SvVote } from '../../models';
+import { AmuletPriceVote, SvVote } from '../../models';
 
 export function myVote(requestCid: ContractId<VoteRequest>, accept: boolean): SvVote {
   return {
@@ -22,6 +22,19 @@ export function myVote(requestCid: ContractId<VoteRequest>, accept: boolean): Sv
     accept,
   };
 }
+
+export const amuletPriceVotes: AmuletPriceVote[] = [
+  {
+    sv: 'digital-asset-2::122073b343bd7a751da8471636096c87df6eb5de9279803c5ea272977def23a9d088',
+    amuletPrice: '1.11',
+    lastUpdatedAt: new Date('2025-02-12T13:50:54.176913Z'),
+  },
+  {
+    sv: 'digital-asset-eng-2::1220a487994f51a4ea99be5d7c94662b91c2154214a312ade0d55367b884b6fd8dfc',
+    amuletPrice: '1.11',
+    lastUpdatedAt: new Date('2025-02-12T10:50:54.176913Z'),
+  },
+];
 
 export const plannedVoteResult: DsoRules_CloseVoteRequestResult = {
   request: {
@@ -172,6 +185,7 @@ export const plannedVoteResult: DsoRules_CloseVoteRequestResult = {
                   walletPayments: '0.1.5',
                 },
                 transferPreapprovalFee: null,
+                featuredAppActivityMarkerAmount: null,
               },
             },
           },
@@ -182,6 +196,7 @@ export const plannedVoteResult: DsoRules_CloseVoteRequestResult = {
       url: '',
       body: 'Adjust fee',
     },
+    targetEffectiveAt: null,
     voteBefore: '2024-09-05T08:40:55.977789Z',
     votes: emptyMap<string, Vote>().set('Digital-Asset-2', {
       sv: 'digital-asset-2::1220a1504d87451ce6a4a1355d71c4f26677d63db5e6298d04b0d1865fd971432a41',
@@ -225,6 +240,7 @@ export const executedVoteResult: DsoRules_CloseVoteRequestResult = {
       url: '',
       body: 'Test 2',
     },
+    targetEffectiveAt: null,
     voteBefore: '2024-09-13T07:51:14.091940Z',
     votes: emptyMap<string, Vote>().set('Digital-Asset-2', {
       sv: 'digital-asset-2::1220a1504d87451ce6a4a1355d71c4f26677d63db5e6298d04b0d1865fd971432a41',
@@ -269,6 +285,7 @@ export const rejectedVoteResult: DsoRules_CloseVoteRequestResult = {
       body: 'Test reject',
     },
     voteBefore: '2024-09-12T08:45:20.307127Z',
+    targetEffectiveAt: null,
     votes: emptyMap<string, Vote>().set('Digital-Asset-2', {
       sv: 'digital-asset-2::1220a1504d87451ce6a4a1355d71c4f26677d63db5e6298d04b0d1865fd971432a41',
       accept: false,
@@ -310,6 +327,7 @@ export const votedRequest: Contract<VoteRequest> = {
       url: '',
       body: 'Test 3',
     },
+    targetEffectiveAt: null,
     trackingCid: null,
     action: {
       tag: 'ARC_DsoRules',

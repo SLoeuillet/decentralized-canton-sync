@@ -22,10 +22,9 @@ import org.lfdecentralizedtrust.splice.validator.config.{
   ValidatorAppBackendConfig,
 }
 import org.lfdecentralizedtrust.splice.wallet.config.WalletAppClientConfig
-import com.digitalasset.canton.DomainAlias
+import com.digitalasset.canton.SynchronizerAlias
 import com.digitalasset.canton.config.*
 import com.digitalasset.canton.config.RequireTypes.Port
-import com.digitalasset.canton.participant.config.RemoteParticipantConfig
 import monocle.macros.syntax.lens.*
 import org.apache.pekko.http.scaladsl.model.Uri
 
@@ -192,6 +191,7 @@ object ConfigTransforms {
       disableOnboardingParticipantPromotionDelay(),
       setDefaultGrpcDeadlineForBuyExtraTraffic(),
       setDefaultGrpcDeadlineForTreasuryService(),
+      enableTxLogBackfilling,
     )
   }
 
@@ -356,14 +356,6 @@ object ConfigTransforms {
     _.focus(_.splitwellAppClients).modify(_.map { case (name, config) =>
       (name, update(config))
     })
-
-  def updateRemoteParticipantConfigs(
-      update: (String, RemoteParticipantConfig) => RemoteParticipantConfig
-  ): ConfigTransform =
-    cantonConfig =>
-      cantonConfig
-        .focus(_.remoteParticipants)
-        .modify(_.map { case (pName, pConfig) => (pName, update(pName.unwrap, pConfig)) })
 
   def bumpCantonDomainPortsBy(bump: Int): ConfigTransform =
     bumpSvAppCantonDomainPortsBy(bump) compose bumpValidatorAppCantonDomainPortsBy(bump)
@@ -617,10 +609,10 @@ object ConfigTransforms {
     transforms.foldLeft((c: SpliceConfig) => c)((f, tf) => f compose tf)
   }
 
-  private def portTransform(bump: Int, c: CommunityAdminServerConfig): CommunityAdminServerConfig =
+  private def portTransform(bump: Int, c: AdminServerConfig): AdminServerConfig =
     c.copy(internalPort = c.internalPort.map(_ + bump))
 
-  private def portTransform(bump: Int, c: ClientConfig): ClientConfig =
+  private def portTransform(bump: Int, c: FullClientConfig): FullClientConfig =
     c.copy(port = c.port + bump)
 
   private def portTransform(bump: Int, c: LedgerApiClientConfig): LedgerApiClientConfig =
@@ -711,9 +703,9 @@ object ConfigTransforms {
       c.copy(
         domains = c.domains.copy(
           splitwell = SplitwellDomains(
-            SynchronizerConfig(DomainAlias.tryCreate("splitwellUpgrade")),
+            SynchronizerConfig(SynchronizerAlias.tryCreate("splitwellUpgrade")),
             Seq(
-              SynchronizerConfig(DomainAlias.tryCreate("splitwell"))
+              SynchronizerConfig(SynchronizerAlias.tryCreate("splitwell"))
             ),
           )
         )
@@ -725,7 +717,7 @@ object ConfigTransforms {
       c.copy(
         domains = c.domains.copy(
           splitwell = SplitwellDomains(
-            SynchronizerConfig(DomainAlias.tryCreate("global")),
+            SynchronizerConfig(SynchronizerAlias.tryCreate("global")),
             Seq.empty,
           )
         )
@@ -735,8 +727,8 @@ object ConfigTransforms {
   def modifyAllANStorageConfigs(
       storageConfigModifier: (
           String,
-          SpliceDbConfig,
-      ) => SpliceDbConfig
+          DbConfig,
+      ) => DbConfig
   ): ConfigTransform = {
     combineAllTransforms(
       updateAllValidatorConfigs((name, config) =>
@@ -804,5 +796,17 @@ object ConfigTransforms {
 
     rows.toMap
   }
+
+  def enableTxLogBackfilling: ConfigTransform =
+    combineAllTransforms(
+      updateAllValidatorConfigs((_, config) =>
+        config
+          .copy(txLogBackfillEnabled = true, txLogBackfillBatchSize = 5)
+      ),
+      updateAllScanAppConfigs((_, config) =>
+        config
+          .copy(txLogBackfillEnabled = true, txLogBackfillBatchSize = 5)
+      ),
+    )
 
 }

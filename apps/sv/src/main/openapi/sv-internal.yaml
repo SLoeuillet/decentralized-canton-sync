@@ -414,7 +414,7 @@ paths:
           content:
             application/json:
               schema:
-                "$ref": "#/components/schemas/ListAmuletPriceVotesResponse"
+                "$ref": "../../../../common/src/main/openapi/common-internal.yaml#/components/schemas/ListAmuletPriceVotesResponse"
   /v0/admin/sv/open-mining-rounds:
     get:
       tags: [sv]
@@ -619,6 +619,21 @@ paths:
         "200":
           description: ok
 
+  /v0/admin/feature-support:
+    get:
+      tags: [ sv ]
+      x-jvm-package: sv_admin
+      operationId: "featureSupport"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "../../../../common/src/main/openapi/common-internal.yaml#/components/schemas/FeatureSupportResponse"
+        "500":
+          $ref: "../../../../common/src/main/openapi/common-external.yaml#/components/responses/500"
+
 components:
   schemas:
     ListOngoingValidatorOnboardingsResponse:
@@ -806,6 +821,9 @@ components:
           type: string
         expiration:
           type: object
+        effectiveTime:
+          type: string
+          format: date-time
 
     ListVotesResponse:
       type: object
@@ -833,16 +851,6 @@ components:
           type: string
         reason_description:
           type: string
-
-    ListAmuletPriceVotesResponse:
-      type: object
-      required:
-        - amulet_price_votes
-      properties:
-        amulet_price_votes:
-          type: array
-          items:
-            $ref: "../../../../common/src/main/openapi/common-external.yaml#/components/schemas/Contract"
 
     ListOpenMiningRoundsResponse:
       type: object

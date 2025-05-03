@@ -1,14 +1,13 @@
 package org.lfdecentralizedtrust.splice.store
 
-import com.daml.metrics.api.noop.NoOpMetricsFactory
-import org.lfdecentralizedtrust.splice.environment.ledger.api.LedgerClient
 import org.lfdecentralizedtrust.splice.scan.store.ScanHistoryBackfilling
 import org.lfdecentralizedtrust.splice.util.DomainRecordTimeRange
 import org.lfdecentralizedtrust.splice.scan.admin.api.client.BackfillingScanConnection
 import org.lfdecentralizedtrust.splice.store.HistoryBackfilling.SourceMigrationInfo
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.UpdateHistoryResponse
 import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.logging.TracedLogger
-import com.digitalasset.canton.topology.DomainId
+import com.digitalasset.canton.topology.SynchronizerId
 import com.digitalasset.canton.tracing.TraceContext
 
 import scala.concurrent.Future
@@ -178,13 +177,13 @@ class ScanHistoryBackfillingTest extends UpdateHistoryTestBase {
       )
       _ <- storeA0.initializeBackfilling(
         0,
-        DomainId.tryFromString(tx1.getDomainId),
+        SynchronizerId.tryFromString(tx1.getSynchronizerId),
         tx1.getUpdateId,
         complete = true,
       )
       _ <- storeB2.initializeBackfilling(
         2,
-        DomainId.tryFromString(tx2.getDomainId),
+        SynchronizerId.tryFromString(tx2.getSynchronizerId),
         tx2.getUpdateId,
         complete = false,
       )
@@ -194,7 +193,7 @@ class ScanHistoryBackfillingTest extends UpdateHistoryTestBase {
   private def backfillAll(
       source: UpdateHistory,
       destination: UpdateHistory,
-      excludeBefore: Map[DomainId, CantonTimestamp],
+      excludeBefore: Map[SynchronizerId, CantonTimestamp],
   ): Future[Boolean] = {
     val connection = new TestBackfillingScanConnection(
       source,
@@ -207,12 +206,11 @@ class ScanHistoryBackfillingTest extends UpdateHistoryTestBase {
       currentMigrationId = destination.domainMigrationInfo.currentMigrationId,
       batchSize = 1,
       loggerFactory = loggerFactory,
-      metricsFactory = NoOpMetricsFactory,
     )
     def go(i: Int): Future[Boolean] = {
       logger.debug(s"backfill() iteration $i")
       backfiller.backfill().flatMap {
-        case HistoryBackfilling.Outcome.MoreWorkAvailableNow => go(i + 1)
+        case HistoryBackfilling.Outcome.MoreWorkAvailableNow(_) => go(i + 1)
         case HistoryBackfilling.Outcome.MoreWorkAvailableLater => Future.successful(false)
         case HistoryBackfilling.Outcome.BackfillingIsComplete => Future.successful(true)
       }
@@ -225,7 +223,7 @@ class ScanHistoryBackfillingTest extends UpdateHistoryTestBase {
     */
   class TestBackfillingScanConnection(
       history: UpdateHistory,
-      excludeBefore: Map[DomainId, CantonTimestamp],
+      excludeBefore: Map[SynchronizerId, CantonTimestamp],
       override val logger: TracedLogger,
   ) extends BackfillingScanConnection {
     override def timeouts = com.digitalasset.canton.config.DefaultProcessingTimeouts.testing
@@ -242,7 +240,7 @@ class ScanHistoryBackfillingTest extends UpdateHistoryTestBase {
             .flatMap { case (k, v) =>
               excludeBefore
                 .get(k)
-                .fold[Option[(DomainId, DomainRecordTimeRange)]](None)(m =>
+                .fold[Option[(SynchronizerId, DomainRecordTimeRange)]](None)(m =>
                   if (v.max < m)
                     None
                   else
@@ -269,22 +267,22 @@ class ScanHistoryBackfillingTest extends UpdateHistoryTestBase {
 
     override def getUpdatesBefore(
         migrationId: Long,
-        domainId: DomainId,
+        synchronizerId: SynchronizerId,
         before: CantonTimestamp,
         atOrAfter: Option[CantonTimestamp],
         count: Int,
-    )(implicit tc: TraceContext): Future[Seq[LedgerClient.GetTreeUpdatesResponse]] =
+    )(implicit tc: TraceContext): Future[Seq[UpdateHistoryResponse]] =
       history
         .getUpdatesBefore(
           migrationId,
-          domainId,
+          synchronizerId,
           before,
           atOrAfter,
           PageLimit.tryCreate(count),
         )(tc)
         .map(
           _.map(_.update).filter(u =>
-            excludeBefore.get(domainId).fold(false)(b => u.update.recordTime >= b)
+            excludeBefore.get(synchronizerId).fold(false)(b => u.update.recordTime >= b)
           )
         )
   }

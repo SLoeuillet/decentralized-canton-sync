@@ -10,8 +10,7 @@ import org.lfdecentralizedtrust.splice.automation.{
   TriggerContext,
 }
 import org.lfdecentralizedtrust.splice.codegen.java.splice.validatorlicense.ValidatorLicense
-import org.lfdecentralizedtrust.splice.environment.{SpliceLedgerConnection, PackageIdResolver}
-import org.lfdecentralizedtrust.splice.scan.admin.api.client.BftScanConnection
+import org.lfdecentralizedtrust.splice.environment.{PackageVersionSupport, SpliceLedgerConnection}
 import org.lfdecentralizedtrust.splice.util.AssignedContract
 import org.lfdecentralizedtrust.splice.validator.store.ValidatorStore
 import com.digitalasset.canton.data.CantonTimestamp
@@ -19,6 +18,8 @@ import com.digitalasset.canton.logging.pretty.{Pretty, PrettyPrinting}
 import com.digitalasset.canton.tracing.TraceContext
 import io.opentelemetry.api.trace.Tracer
 import org.apache.pekko.stream.Materializer
+import org.lfdecentralizedtrust.splice.environment.PackageVersionSupport.FeatureSupport
+
 import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.OptionConverters.*
 
@@ -26,7 +27,7 @@ class ValidatorLicenseActivityTrigger(
     override protected val context: TriggerContext,
     connection: SpliceLedgerConnection,
     store: ValidatorStore,
-    scanConnection: BftScanConnection,
+    packageVersionSupport: PackageVersionSupport,
 )(implicit override val ec: ExecutionContext, override val tracer: Tracer, mat: Materializer)
     extends ScheduledTaskTrigger[ValidatorLicenseActivityTrigger.Task] {
 
@@ -36,13 +37,13 @@ class ValidatorLicenseActivityTrigger(
       tc: TraceContext
   ): Future[Seq[ValidatorLicenseActivityTrigger.Task]] =
     for {
-      amuletRules <- scanConnection.getAmuletRules()
-      supportsValidatorLicenseActivity = PackageIdResolver.supportsValidatorLicenseActivity(
-        now,
-        amuletRules.payload,
-      )
+      validatorLicenseActivityFeatureSupport <- packageVersionSupport
+        .supportsValidatorLicenseActivity(
+          Seq(store.key.dsoParty, validator),
+          now,
+        )
       tasks <-
-        if (supportsValidatorLicenseActivity) {
+        if (validatorLicenseActivityFeatureSupport.supported) {
           for {
             licenseO <- store
               .lookupValidatorLicenseWithOffset()
@@ -57,7 +58,8 @@ class ValidatorLicenseActivityTrigger(
               )
               .map(license =>
                 ValidatorLicenseActivityTrigger.Task(
-                  license
+                  license,
+                  validatorLicenseActivityFeatureSupport,
                 )
               )
           }
@@ -79,6 +81,7 @@ class ValidatorLicenseActivityTrigger(
         ),
       )
       .noDedup
+      .withPrefferedPackage(task.work.featureSupport.packageIds)
       .yieldUnit()
       .map(_ =>
         TaskSuccess(
@@ -102,11 +105,13 @@ object ValidatorLicenseActivityTrigger {
   private val activityReportMinInterval = java.time.Duration.ofHours(1)
 
   final case class Task(
-      existingLicense: AssignedContract[ValidatorLicense.ContractId, ValidatorLicense]
+      existingLicense: AssignedContract[ValidatorLicense.ContractId, ValidatorLicense],
+      featureSupport: FeatureSupport,
   ) extends PrettyPrinting {
     override def pretty: Pretty[this.type] = {
       prettyOfClass(
-        param("existingLicense", _.existingLicense)
+        param("existingLicense", _.existingLicense),
+        param("featureSupport", _.featureSupport),
       )
     }
   }

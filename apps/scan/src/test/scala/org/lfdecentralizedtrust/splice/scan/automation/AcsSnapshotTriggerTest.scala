@@ -6,12 +6,7 @@ import com.daml.metrics.api.noop.NoOpMetricsFactory
 import org.lfdecentralizedtrust.splice.automation.{TriggerContext, TriggerEnabledSynchronization}
 import org.lfdecentralizedtrust.splice.config.AutomationConfig
 import org.lfdecentralizedtrust.splice.environment.RetryProvider
-import org.lfdecentralizedtrust.splice.environment.ledger.api.LedgerClient.GetTreeUpdatesResponse
-import org.lfdecentralizedtrust.splice.environment.ledger.api.{
-  LedgerClient,
-  TransactionTreeUpdate,
-  TreeUpdate,
-}
+import org.lfdecentralizedtrust.splice.environment.ledger.api.{TransactionTreeUpdate, TreeUpdate}
 import org.lfdecentralizedtrust.splice.scan.store.AcsSnapshotStore
 import org.lfdecentralizedtrust.splice.scan.store.AcsSnapshotStore.AcsSnapshot
 import org.lfdecentralizedtrust.splice.store.{
@@ -20,12 +15,13 @@ import org.lfdecentralizedtrust.splice.store.{
   TreeUpdateWithMigrationId,
   UpdateHistory,
 }
+import UpdateHistory.UpdateHistoryResponse
 import org.lfdecentralizedtrust.splice.util.DomainRecordTimeRange
 import com.digitalasset.canton.concurrent.FutureSupervisor
 import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.logging.SuppressionRule
 import com.digitalasset.canton.time.SimClock
-import com.digitalasset.canton.topology.DomainId
+import com.digitalasset.canton.topology.SynchronizerId
 import com.digitalasset.canton.tracing.TraceContext
 import com.digitalasset.canton.{BaseTest, HasActorSystem, HasExecutionContext}
 import org.scalatest.wordspec.AnyWordSpec
@@ -126,7 +122,7 @@ class AcsSnapshotTriggerTest
           Future.successful(
             Seq(
               TreeUpdateWithMigrationId(
-                GetTreeUpdatesResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
+                UpdateHistoryResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
                 1L,
               )
             )
@@ -163,7 +159,7 @@ class AcsSnapshotTriggerTest
           Future.successful(
             Seq(
               TreeUpdateWithMigrationId(
-                GetTreeUpdatesResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
+                UpdateHistoryResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
                 1L,
               )
             )
@@ -184,7 +180,7 @@ class AcsSnapshotTriggerTest
           Future.successful(
             Seq(
               TreeUpdateWithMigrationId(
-                GetTreeUpdatesResponse(treeUpdate(now.plusSeconds(1800L)), dummyDomain),
+                UpdateHistoryResponse(treeUpdate(now.plusSeconds(1800L)), dummyDomain),
                 1L,
               )
             )
@@ -214,7 +210,7 @@ class AcsSnapshotTriggerTest
             Future.successful(
               Seq(
                 TreeUpdateWithMigrationId(
-                  GetTreeUpdatesResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
+                  UpdateHistoryResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
                   1L,
                 )
               )
@@ -244,7 +240,7 @@ class AcsSnapshotTriggerTest
             Future.successful(
               Seq(
                 TreeUpdateWithMigrationId(
-                  GetTreeUpdatesResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
+                  UpdateHistoryResponse(treeUpdate(now.minusSeconds(1800L)), dummyDomain),
                   1L,
                 )
               )
@@ -267,7 +263,7 @@ class AcsSnapshotTriggerTest
             Future.successful(
               Seq(
                 TreeUpdateWithMigrationId(
-                  GetTreeUpdatesResponse(treeUpdate(now.plusSeconds(1800L)), dummyDomain),
+                  UpdateHistoryResponse(treeUpdate(now.plusSeconds(1800L)), dummyDomain),
                   1L,
                 )
               )
@@ -447,7 +443,7 @@ class AcsSnapshotTriggerTest
           Future.successful(
             Seq(
               TreeUpdateWithMigrationId(
-                GetTreeUpdatesResponse(treeUpdate(now.minusSeconds(1L)), dummyDomain),
+                UpdateHistoryResponse(treeUpdate(now.minusSeconds(1L)), dummyDomain),
                 1L,
               )
             )
@@ -468,7 +464,7 @@ class AcsSnapshotTriggerTest
           Future.successful(
             Seq(
               TreeUpdateWithMigrationId(
-                GetTreeUpdatesResponse(treeUpdate(now.plusSeconds(1800L)), dummyDomain),
+                UpdateHistoryResponse(treeUpdate(now.plusSeconds(1800L)), dummyDomain),
                 1L,
               )
             )
@@ -503,7 +499,7 @@ class AcsSnapshotTriggerTest
     def now = cantonTimestamp("2007-12-03T10:15:30.00Z")
     clock.advanceTo(now)
 
-    val dummyDomain = DomainId.tryFromString("dummy::domain")
+    val dummyDomain = SynchronizerId.tryFromString("dummy::domain")
     def treeUpdate(recordTime: CantonTimestamp): TreeUpdate = {
       TransactionTreeUpdate(
         new TransactionTree(
@@ -513,7 +509,6 @@ class AcsSnapshotTriggerTest
           recordTime.toInstant,
           0L,
           java.util.Map.of(),
-          java.util.List.of(),
           dummyDomain.toProtoPrimitive,
           TraceContextOuterClass.TraceContext.getDefaultInstance,
           recordTime.toInstant,
@@ -535,7 +530,7 @@ class AcsSnapshotTriggerTest
     when(store.currentMigrationId).thenReturn(currentMigrationId)
     val updateHistory: UpdateHistory = mock[UpdateHistory]
     when(updateHistory.isReady).thenReturn(true)
-    val sourceHistory = mock[HistoryBackfilling.SourceHistory[LedgerClient.GetTreeUpdatesResponse]]
+    val sourceHistory = mock[HistoryBackfilling.SourceHistory[UpdateHistoryResponse]]
     // migrationInfo() is only used to check whether backfilling is complete
     when(sourceHistory.migrationInfo(anyLong)(any[TraceContext]))
       .thenReturn(
@@ -600,7 +595,7 @@ class AcsSnapshotTriggerTest
         Future.successful(
           Seq(
             TreeUpdateWithMigrationId(
-              GetTreeUpdatesResponse(
+              UpdateHistoryResponse(
                 treeUpdate(updateRecordTime),
                 dummyDomain,
               ),

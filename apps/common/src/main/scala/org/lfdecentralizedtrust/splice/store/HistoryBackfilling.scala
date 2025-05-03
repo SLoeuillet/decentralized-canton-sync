@@ -3,8 +3,6 @@
 
 package org.lfdecentralizedtrust.splice.store
 
-import com.daml.metrics.api.MetricHandle.LabeledMetricsFactory
-import com.daml.metrics.api.MetricsContext
 import org.lfdecentralizedtrust.splice.store.HistoryBackfilling.Outcome.{
   BackfillingIsComplete,
   MoreWorkAvailableLater,
@@ -20,7 +18,7 @@ import org.lfdecentralizedtrust.splice.store.HistoryBackfilling.{
 import org.lfdecentralizedtrust.splice.util.DomainRecordTimeRange
 import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.logging.{NamedLoggerFactory, NamedLogging}
-import com.digitalasset.canton.topology.DomainId
+import com.digitalasset.canton.topology.SynchronizerId
 import com.digitalasset.canton.tracing.TraceContext
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -50,16 +48,9 @@ final class HistoryBackfilling[T](
     currentMigrationId: Long,
     batchSize: Int,
     override protected val loggerFactory: NamedLoggerFactory,
-    metricsFactory: LabeledMetricsFactory,
 )(implicit
     ec: ExecutionContext
 ) extends NamedLogging {
-
-  private val historyMetrics = new HistoryMetrics(metricsFactory)(
-    MetricsContext(
-      "current_migration_id" -> currentMigrationId.toString
-    )
-  )
 
   /** Backfill a small part of the destination history, making sure that the destination history won't have any gaps.
     *
@@ -131,22 +122,12 @@ final class HistoryBackfilling[T](
     for {
       // For UX reasons, we pick the domain that is most behind in history, and backfill from there
       result <- backfillFrom.recordTimes.headOption match {
-        case Some((domainId, backfillFrom)) =>
+        case Some((synchronizerId, backfillFrom)) =>
           logger.info(
-            s"Backfilling domain ${domainId} from ${backfillFrom} for migration ${migrationId}"
+            s"Backfilling domain ${synchronizerId} from ${backfillFrom} for migration ${migrationId}"
           )
-          backfillDomain(migrationId, domainId, backfillFrom).map { insertResult =>
-            historyMetrics.Backfilling.latestRecordTime.updateValue(
-              insertResult.lastBackfilledRecordTime.toMicros
-            )
-            // Using MetricsContext.Empty is okay, because it's merged with the StoreMetrics context
-            historyMetrics.Backfilling.updateCount.inc(
-              insertResult.backfilledUpdates
-            )(MetricsContext.Empty)
-            historyMetrics.Backfilling.eventCount.inc(insertResult.backfilledUpdates)(
-              MetricsContext.Empty
-            )
-            MoreWorkAvailableNow
+          backfillDomain(migrationId, synchronizerId, backfillFrom).map { insertResult =>
+            MoreWorkAvailableNow(insertResult)
           }
         case None =>
           if (backfillFrom.missingData) {
@@ -169,7 +150,6 @@ final class HistoryBackfilling[T](
                     "This history won't need any further backfilling."
                 )
                 destination.markBackfillingComplete().map { _ =>
-                  historyMetrics.Backfilling.completed.updateValue(1)
                   BackfillingIsComplete
                 }
             }
@@ -187,12 +167,12 @@ final class HistoryBackfilling[T](
     * @param missingData  True if there are domains for which we do not know where to backfill from yet.
     */
   case class BackfillUpdatesBefore(
-      recordTimes: Seq[(DomainId, CantonTimestamp)],
+      recordTimes: Seq[(SynchronizerId, CantonTimestamp)],
       missingData: Boolean,
   )
   def getBackfillUpdatesBefore(
-      destRecordTimes: Map[DomainId, CantonTimestamp],
-      srcRecordTimes: Map[DomainId, DomainRecordTimeRange],
+      destRecordTimes: Map[SynchronizerId, CantonTimestamp],
+      srcRecordTimes: Map[SynchronizerId, DomainRecordTimeRange],
       migrationId: Long,
   )(implicit tc: TraceContext): BackfillUpdatesBefore = {
     logger.debug(
@@ -202,26 +182,26 @@ final class HistoryBackfilling[T](
     var missingData = false
     val result = srcRecordTimes
       .map {
-        case (domainId, srcRecordTime) => {
-          val backfillFrom = destRecordTimes.get(domainId) match {
+        case (synchronizerId, srcRecordTime) => {
+          val backfillFrom = destRecordTimes.get(synchronizerId) match {
             case Some(destRecordTime) =>
               // Both source and destination history have data for this domain
               if (destRecordTime == srcRecordTime.min) {
                 // Source and destination history are both at the same record time, nothing to do
                 logger.debug(
-                  s"Source and destination history are both at the same record time: domain ${domainId}, migration ${migrationId}, time ${destRecordTime}"
+                  s"Source and destination history are both at the same record time: domain ${synchronizerId}, migration ${migrationId}, time ${destRecordTime}"
                 )
                 None
               } else if (destRecordTime > srcRecordTime.min) {
                 // Destination history has less data than source history, start backfilling from the oldest destination item
                 logger.debug(
-                  s"Destination history has less data than source history: domain ${domainId}, migration ${migrationId}, dest min ${destRecordTime}, src min ${srcRecordTime.min}"
+                  s"Destination history has less data than source history: domain ${synchronizerId}, migration ${migrationId}, dest min ${destRecordTime}, src min ${srcRecordTime.min}"
                 )
                 Some(destRecordTime)
               } else {
                 // Destination history has more data than source history?!?
                 logger.error(
-                  s"Destination history has more data than source history: domain ${domainId}, migration ${migrationId}, dest min ${destRecordTime}, src min ${srcRecordTime.min}"
+                  s"Destination history has more data than source history: domain ${synchronizerId}, migration ${migrationId}, dest min ${destRecordTime}, src min ${srcRecordTime.min}"
                 )
                 None
               }
@@ -231,7 +211,7 @@ final class HistoryBackfilling[T](
                 // Destination ingestion is working on `currentMigrationId` and won't touch this migration id,
                 // so we can safely backfill from the newest item in the source history.
                 logger.debug(
-                  s"No destination data for domain ${domainId}, migration ${migrationId}. Backfilling from the newest item."
+                  s"No destination data for domain ${synchronizerId}, migration ${migrationId}. Backfilling from the newest item."
                 )
                 Some(CantonTimestamp.MaxValue)
               } else {
@@ -239,18 +219,18 @@ final class HistoryBackfilling[T](
                 // To avoid race conditions, we skip backfilling this domain id until we have ingested the first item
                 // from which we then can backfill.
                 logger.debug(
-                  s"No destination data for domain ${domainId}, migration ${migrationId}. Waiting until first item is ingested."
+                  s"No destination data for domain ${synchronizerId}, migration ${migrationId}. Waiting until first item is ingested."
                 )
                 missingData = true
                 None
               }
           }
-          domainId -> backfillFrom
+          synchronizerId -> backfillFrom
         }
       }
       .toSeq
       .flatMap({
-        case (domainId, Some(backfillFrom)) => Some(domainId -> backfillFrom)
+        case (synchronizerId, Some(backfillFrom)) => Some(synchronizerId -> backfillFrom)
         case _ => None
       })
       .sortBy(_._2)
@@ -259,17 +239,17 @@ final class HistoryBackfilling[T](
 
   def backfillDomain(
       migrationId: Long,
-      domainId: DomainId,
+      synchronizerId: SynchronizerId,
       backfillFrom: CantonTimestamp,
   )(implicit
       tc: TraceContext
   ): Future[HistoryBackfilling.DestinationHistory.InsertResult] = {
     for {
-      items <- source.items(migrationId, domainId, backfillFrom, batchSize)
-      last <- destination.insert(migrationId, domainId, items)
+      items <- source.items(migrationId, synchronizerId, backfillFrom, batchSize)
+      last <- destination.insert(migrationId, synchronizerId, items)
     } yield {
       logger.debug(
-        s"Backfilled ${items.size} items for domain ${domainId} in migration ${migrationId} before record time ${backfillFrom}"
+        s"Backfilled ${items.size} items for domain ${synchronizerId} in migration ${migrationId} before record time ${backfillFrom}"
       )
       last
     }
@@ -280,12 +260,13 @@ final class HistoryBackfilling[T](
 object HistoryBackfilling {
 
   sealed trait Outcome extends Product with Serializable
+
   object Outcome {
 
     /** Backfilling is not complete, and there is more work to do right now.
       * Call backfill() again immediately.
       */
-    final case object MoreWorkAvailableNow extends Outcome
+    final case class MoreWorkAvailableNow(workDone: DestinationHistory.InsertResult) extends Outcome
 
     /** Backfilling is not complete, but cannot proceed right now.
       * Call backfill() again after a short delay.
@@ -311,7 +292,7 @@ object HistoryBackfilling {
     */
   final case class SourceMigrationInfo(
       previousMigrationId: Option[Long],
-      recordTimeRange: Map[DomainId, DomainRecordTimeRange],
+      recordTimeRange: Map[SynchronizerId, DomainRecordTimeRange],
       complete: Boolean,
   )
 
@@ -323,7 +304,7 @@ object HistoryBackfilling {
     */
   final case class DestinationBackfillingInfo(
       migrationId: Long,
-      backfilledAt: Map[DomainId, CantonTimestamp],
+      backfilledAt: Map[SynchronizerId, CantonTimestamp],
   )
 
   trait SourceHistory[T] {
@@ -342,7 +323,7 @@ object HistoryBackfilling {
       */
     def items(
         migrationId: Long,
-        domainId: DomainId,
+        synchronizerId: SynchronizerId,
         before: CantonTimestamp,
         count: Int,
     )(implicit tc: TraceContext): Future[Seq[T]]
@@ -361,7 +342,7 @@ object HistoryBackfilling {
     /** Insert the given sequence of history items. The caller must make sure calls to this
       * function don't leave any gaps in the history.
       */
-    def insert(migrationId: Long, domainId: DomainId, items: Seq[T])(implicit
+    def insert(migrationId: Long, synchronizerId: SynchronizerId, items: Seq[T])(implicit
         tc: TraceContext
     ): Future[DestinationHistory.InsertResult]
 

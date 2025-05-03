@@ -19,6 +19,7 @@ import org.lfdecentralizedtrust.splice.environment.ledger.api.{
   IncompleteReassignmentEvent,
   ReassignmentEvent,
   TreeUpdate,
+  TreeUpdateOrOffsetCheckpoint,
 }
 import org.lfdecentralizedtrust.splice.store.MultiDomainAcsStore.HasIngestionSink
 import org.lfdecentralizedtrust.splice.store.db.AcsQueries.SelectFromAcsTableResult
@@ -39,12 +40,13 @@ import com.digitalasset.canton.logging.NamedLogging
 import com.digitalasset.canton.logging.pretty.{Pretty, PrettyPrinting}
 import com.daml.metrics.api.MetricHandle.LabeledMetricsFactory
 import com.digitalasset.canton.participant.pretty.Implicits.prettyContractId
-import com.digitalasset.canton.topology.{DomainId, PartyId}
+import com.digitalasset.canton.topology.{PartyId, SynchronizerId}
 import com.digitalasset.canton.tracing.TraceContext
 import com.digitalasset.canton.util.ShowUtil.*
 import com.google.protobuf.ByteString
 import io.circe.Json
 import io.grpc.Status
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.UpdateHistoryResponse
 
 import java.time.Instant
 import scala.concurrent.{ExecutionContext, Future}
@@ -84,7 +86,7 @@ trait MultiDomainAcsStore extends HasIngestionSink with AutoCloseable with Named
     */
   def lookupContractByIdOnDomain[C, TCid <: ContractId[_], T](
       companion: C
-  )(domain: DomainId, id: ContractId[_])(implicit
+  )(domain: SynchronizerId, id: ContractId[_])(implicit
       ec: ExecutionContext,
       companionClass: ContractCompanion[C, TCid, T],
       traceContext: TraceContext,
@@ -127,7 +129,7 @@ trait MultiDomainAcsStore extends HasIngestionSink with AutoCloseable with Named
     */
   final def getContractByIdOnDomain[C, TCid <: ContractId[_], T](
       companion: C
-  )(domain: DomainId, id: ContractId[_])(implicit
+  )(domain: SynchronizerId, id: ContractId[_])(implicit
       ec: ExecutionContext,
       companionClass: ContractCompanion[C, TCid, T],
       traceContext: TraceContext,
@@ -168,7 +170,7 @@ trait MultiDomainAcsStore extends HasIngestionSink with AutoCloseable with Named
     */
   def listContractsOnDomain[C, TCid <: ContractId[_], T](
       companion: C,
-      domain: DomainId,
+      domain: SynchronizerId,
       limit: Limit = Limit.DefaultLimit,
   )(implicit
       companionClass: ContractCompanion[C, TCid, T],
@@ -186,7 +188,7 @@ trait MultiDomainAcsStore extends HasIngestionSink with AutoCloseable with Named
     * itself as the source of the sort key.
     */
   def listAssignedContractsNotOnDomainN(
-      excludedDomain: DomainId,
+      excludedDomain: SynchronizerId,
       companions: Seq[ConstrainedTemplate],
       limit: notOnDomainsTotalLimit.type = notOnDomainsTotalLimit,
   )(implicit tc: TraceContext): Future[Seq[AssignedContract[?, ?]]]
@@ -242,9 +244,27 @@ trait MultiDomainAcsStore extends HasIngestionSink with AutoCloseable with Named
   private[store] def listIncompleteReassignments()(implicit
       tc: TraceContext
   ): Future[Map[ContractId[_], NonEmpty[Set[ReassignmentId]]]]
+
+  /** Testing API: lookup last ingested offset */
+  private[store] def lookupLastIngestedOffset()(implicit tc: TraceContext): Future[Option[Long]]
+
+  def initializeTxLogBackfilling()(implicit tc: TraceContext): Future[Unit]
+
+  def getTxLogBackfillingState()(implicit
+      tc: TraceContext
+  ): Future[TxLogBackfillingState]
+
+  def destinationHistory: HistoryBackfilling.DestinationHistory[UpdateHistoryResponse]
 }
 
 object MultiDomainAcsStore {
+
+  sealed trait TxLogBackfillingState
+  object TxLogBackfillingState {
+    case object Complete extends TxLogBackfillingState
+    case object InProgress extends TxLogBackfillingState
+    case object NotInitialized extends TxLogBackfillingState
+  }
 
   trait HasIngestionSink {
     def ingestionSink: MultiDomainAcsStore.IngestionSink
@@ -423,7 +443,7 @@ object MultiDomainAcsStore {
 
     def toTransactionFilter: LapiTransactionFilter =
       LapiTransactionFilter(
-        Map(
+        filtersByParty = Map(
           primaryParty.toProtoPrimitive -> com.daml.ledger.api.v2.transaction_filter.Filters(
             Seq(
               CumulativeFilter(
@@ -433,7 +453,8 @@ object MultiDomainAcsStore {
               )
             )
           )
-        )
+        ),
+        filtersForAnyParty = None,
       )
   }
 
@@ -548,7 +569,7 @@ object MultiDomainAcsStore {
       type T <: Template
     }
 
-  final case class ReassignmentId(source: DomainId, id: String)
+  final case class ReassignmentId(source: SynchronizerId, id: String)
 
   object ReassignmentId {
     def fromAssign(in: ReassignmentEvent.Assign) =
@@ -560,33 +581,34 @@ object MultiDomainAcsStore {
   sealed abstract class ContractState extends PrettyPrinting with Product with Serializable {
     def isAssigned: Boolean
 
-    def fold[Z](assigned: DomainId => Z, inFlight: => Z): Z
+    def fold[Z](assigned: SynchronizerId => Z, inFlight: => Z): Z
   }
 
   object ContractState {
     case class Assigned(
-        domain: DomainId
+        domain: SynchronizerId
     ) extends ContractState {
       override def pretty: Pretty[this.type] =
         prettyOfClass(param("domain", _.domain))
       override def isAssigned = true
 
-      override def fold[Z](assigned: DomainId => Z, inFlight: => Z) = assigned(domain)
+      override def fold[Z](assigned: SynchronizerId => Z, inFlight: => Z) = assigned(domain)
     }
 
     case object InFlight extends ContractState {
       override def pretty: Pretty[this.type] = prettyOfObject[InFlight.type]
       override val isAssigned = false
-      override def fold[Z](assigned: DomainId => Z, inFlight: => Z) = inFlight
+      override def fold[Z](assigned: SynchronizerId => Z, inFlight: => Z) = inFlight
     }
   }
 
   trait IngestionSink {
+    import IngestionSink.*
 
     def ingestionFilter: IngestionFilter
 
-    /** Must be the first method called. Returns the last ingested offset, if any. */
-    def initialize()(implicit traceContext: TraceContext): Future[Option[Long]]
+    /** Must be the first method called. Returns information about where and how to start ingestion. */
+    def initialize()(implicit traceContext: TraceContext): Future[IngestionStart]
 
     def ingestAcs(
         offset: Long,
@@ -595,9 +617,40 @@ object MultiDomainAcsStore {
         incompleteIn: Seq[IncompleteReassignmentEvent.Assign],
     )(implicit traceContext: TraceContext): Future[Unit]
 
-    def ingestUpdate(domain: DomainId, transfer: TreeUpdate)(implicit
+    def ingestUpdate(update: TreeUpdateOrOffsetCheckpoint)(implicit
         traceContext: TraceContext
     ): Future[Unit]
+
+    def ingestUpdate(synchronizerId: SynchronizerId, update: TreeUpdate)(implicit
+        traceContext: TraceContext
+    ): Future[Unit] =
+      ingestUpdate(TreeUpdateOrOffsetCheckpoint.Update(update, synchronizerId))
+  }
+
+  object IngestionSink {
+    sealed trait IngestionStart
+
+    object IngestionStart {
+
+      /** Ingestion service should ingest the ACS at an offset chosen by the service,
+        * then resume ingesting updates from there
+        */
+      final case object InitializeAcsAtLatestOffset extends IngestionStart
+
+      /** Ingestion service should ingest the ACS at the specified offset,
+        * then resume ingesting updates from there
+        */
+      final case class InitializeAcsAtOffset(
+          offset: Long
+      ) extends IngestionStart
+
+      /** Ingestion service should resume ingesting updates from the specified offset
+        */
+      final case class ResumeAtOffset(
+          offset: Long
+      ) extends IngestionStart
+    }
+
   }
 
   // The state of a contract in the store. Note that, contrary to `ContractState`, this can
@@ -616,7 +669,7 @@ object MultiDomainAcsStore {
 
     /** Observed activation (assign/create).
       */
-    final case class Assigned(domain: DomainId) extends StoreContractState {
+    final case class Assigned(domain: SynchronizerId) extends StoreContractState {
       override def pretty: Pretty[this.type] = prettyOfClass(
         param("domain", _.domain)
       )
@@ -646,7 +699,7 @@ object MultiDomainAcsStore {
       state: StoreContractState,
   ) extends PrettyPrinting {
 
-    def toAssigned: Option[DomainId] = state match {
+    def toAssigned: Option[SynchronizerId] = state match {
       case StoreContractState.Assigned(domain) => Some(domain)
       case StoreContractState.InFlight(_) | StoreContractState.Archived => None
     }

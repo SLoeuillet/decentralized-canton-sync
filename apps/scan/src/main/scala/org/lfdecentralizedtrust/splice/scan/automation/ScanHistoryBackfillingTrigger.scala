@@ -3,6 +3,7 @@
 
 package org.lfdecentralizedtrust.splice.scan.automation
 
+import com.daml.metrics.api.MetricsContext
 import org.lfdecentralizedtrust.splice.automation.{
   PollingParallelTaskExecutionTrigger,
   TaskNoop,
@@ -26,6 +27,7 @@ import org.lfdecentralizedtrust.splice.scan.store.ScanHistoryBackfilling.{
 import org.lfdecentralizedtrust.splice.scan.store.{ScanHistoryBackfilling, ScanStore}
 import org.lfdecentralizedtrust.splice.store.{
   HistoryBackfilling,
+  HistoryMetrics,
   PageLimit,
   TreeUpdateWithMigrationId,
 }
@@ -37,6 +39,7 @@ import com.digitalasset.canton.topology.PartyId
 import com.digitalasset.canton.tracing.TraceContext
 import io.opentelemetry.api.trace.Tracer
 import org.apache.pekko.stream.Materializer
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.BackfillingState
 
 import scala.concurrent.{ExecutionContextExecutor, Future, blocking}
 
@@ -57,6 +60,12 @@ class ScanHistoryBackfillingTrigger(
 ) extends PollingParallelTaskExecutionTrigger[ScanHistoryBackfillingTrigger.Task] {
 
   private val currentMigrationId = store.updateHistory.domainMigrationInfo.currentMigrationId
+
+  private val historyMetrics = new HistoryMetrics(context.metricsFactory)(
+    MetricsContext(
+      "current_migration_id" -> currentMigrationId.toString
+    )
+  )
 
   /** A cursor for iterating over the beginning of the update history in findHistoryStart,
     *  see [[org.lfdecentralizedtrust.splice.store.UpdateHistory.getUpdates()]].
@@ -82,11 +91,12 @@ class ScanHistoryBackfillingTrigger(
       Future.successful(Seq.empty)
     } else {
       store.updateHistory.getBackfillingState().map {
-        case Some(state) if state.complete =>
+        case BackfillingState.Complete =>
+          historyMetrics.UpdateHistoryBackfilling.completed.updateValue(1)
           Seq.empty
-        case Some(_) =>
+        case BackfillingState.InProgress =>
           Seq(ScanHistoryBackfillingTrigger.BackfillTask())
-        case None =>
+        case BackfillingState.NotInitialized =>
           Seq(ScanHistoryBackfillingTrigger.InitializeBackfillingTask(findHistoryStartAfter))
       }
     }
@@ -121,7 +131,7 @@ class ScanHistoryBackfillingTrigger(
             _ <- store.updateHistory
               .initializeBackfilling(
                 treeUpdate.migrationId,
-                treeUpdate.update.domainId,
+                treeUpdate.update.synchronizerId,
                 treeUpdate.update.update.updateId,
                 complete = true,
               )
@@ -142,14 +152,14 @@ class ScanHistoryBackfillingTrigger(
             // Note that this will also delete the import updates because they have a record time of 0,
             // which is good because we want to remove them.
             _ <- store.updateHistory.deleteUpdatesBefore(
-              domainId = treeUpdate.update.domainId,
+              synchronizerId = treeUpdate.update.synchronizerId,
               migrationId = treeUpdate.migrationId,
               recordTime = treeUpdate.update.update.recordTime,
             )
             _ <- store.updateHistory
               .initializeBackfilling(
                 treeUpdate.migrationId,
-                treeUpdate.update.domainId,
+                treeUpdate.update.synchronizerId,
                 treeUpdate.update.update.updateId,
                 complete = false,
               )
@@ -234,7 +244,6 @@ class ScanHistoryBackfillingTrigger(
               currentMigrationId = currentMigrationId,
               batchSize = batchSize,
               loggerFactory = loggerFactory,
-              metricsFactory = context.metricsFactory,
             )
           backfillingVar = Some(backfilling)
           backfilling
@@ -246,11 +255,24 @@ class ScanHistoryBackfillingTrigger(
     connection <- getOrCreateScanConnection()
     backfilling = getOrCreateBackfilling(connection)
     outcome <- backfilling.backfill().map {
-      case HistoryBackfilling.Outcome.MoreWorkAvailableNow =>
+      case HistoryBackfilling.Outcome.MoreWorkAvailableNow(workDone) =>
+        historyMetrics.UpdateHistoryBackfilling.completed.updateValue(0)
+        // Using MetricsContext.Empty is okay, because it's merged with the StoreMetrics context
+        historyMetrics.UpdateHistoryBackfilling.latestRecordTime.updateValue(
+          workDone.lastBackfilledRecordTime.toMicros
+        )(MetricsContext.Empty)
+        historyMetrics.UpdateHistoryBackfilling.updateCount.inc(
+          workDone.backfilledUpdates
+        )(MetricsContext.Empty)
+        historyMetrics.UpdateHistoryBackfilling.eventCount.inc(workDone.backfilledEvents)(
+          MetricsContext.Empty
+        )
         TaskSuccess("Backfilling step completed")
       case HistoryBackfilling.Outcome.MoreWorkAvailableLater =>
+        historyMetrics.UpdateHistoryBackfilling.completed.updateValue(0)
         TaskNoop
       case HistoryBackfilling.Outcome.BackfillingIsComplete =>
+        historyMetrics.UpdateHistoryBackfilling.completed.updateValue(1)
         logger.info(
           "UpdateHistory backfilling is complete, this trigger should not do any work ever again"
         )

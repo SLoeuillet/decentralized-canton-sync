@@ -1,7 +1,7 @@
 // Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-import { useVotesHooks } from 'common-frontend';
-import { Loading, SvVote } from 'common-frontend';
+import { useVotesHooks } from '@lfdecentralizedtrust/splice-common-frontend';
+import { Loading, SvVote } from '@lfdecentralizedtrust/splice-common-frontend';
 import dayjs from 'dayjs';
 import React, { useEffect } from 'react';
 
@@ -17,13 +17,17 @@ interface VoteRequestModalProps {
     voteRequestContractId: ContractId<VoteRequest>,
     currentSvVote: SvVote | undefined
   ) => React.ReactNode;
-  effectiveAt?: string;
+  getMemberName: (partyId: string) => string;
+  expiresAt?: Date;
+  effectiveAt?: Date;
 }
 
 const VoteRequestModalContent: React.FC<VoteRequestModalProps> = ({
   voteRequestContractId,
   handleClose,
   voteForm,
+  getMemberName,
+  expiresAt,
   effectiveAt,
 }) => {
   const votesHooks = useVotesHooks();
@@ -79,12 +83,14 @@ const VoteRequestModalContent: React.FC<VoteRequestModalProps> = ({
       voteRequestContractId={voteRequestContractId}
       actionReq={voteRequestQuery.data.payload.action}
       requester={voteRequestQuery.data.payload.requester}
+      getMemberName={getMemberName}
       reason={voteRequestQuery.data.payload.reason}
       voteBefore={dayjs(voteRequestQuery.data.payload.voteBefore).toDate()}
       rejectedVotes={rejectedVotes}
       acceptedVotes={acceptedVotes}
       voteForm={voteForm}
       curSvVote={curSvVote}
+      expiresAt={expiresAt}
       effectiveAt={effectiveAt}
     />
   );

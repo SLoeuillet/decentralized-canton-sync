@@ -7,6 +7,7 @@ module Splice.Fees where
 import Splice.Types
 import Splice.RelRound
 import DA.Time
+import Splice.Util
 
 -- Time utilities
 -----------------
@@ -22,6 +23,9 @@ relTimeToDays dt = relTimeToMicros dt / microsPerDay
 
 daysToRelTime : Decimal -> RelTime
 daysToRelTime d = convertMicrosecondsToRelTime $ ceiling $ d * microsPerDay
+
+relTimeToSeconds : RelTime -> Decimal
+relTimeToSeconds dt = relTimeToMicros dt / 1e6
 
 
 -- Rates per mining round
@@ -129,3 +133,30 @@ expiringAmount ratePerRound initialAmount createdAt =
 
 getValueAsOfRound0 : ExpiringAmount -> Decimal
 getValueAsOfRound0 e = e.initialAmount + e.ratePerRound.rate * intToDecimal e.createdAt.number
+
+instance Patchable SteppedRate where
+  patch new base current = SteppedRate with
+    initialRate = patch new.initialRate base.initialRate current.initialRate
+    steps = patchListAsScalar new.steps base.steps current.steps
+
+instance Patchable FixedFee where
+  patch new base current = FixedFee with
+    fee = patch new.fee base.fee current.fee
+
+instance Patchable RatePerRound where
+  patch new base current = RatePerRound with
+    rate = patch new.rate base.rate current.rate
+
+-- RatePerDay
+----------------
+data RatePerDay = RatePerDay with
+    rate : Decimal
+  deriving (Eq, Ord, Show)
+
+chargeRatePerDay : RatePerDay -> RelTime -> Decimal
+chargeRatePerDay rate dt = rate.rate * relTimeToDays dt
+
+ratePerRoundToRatePerDay : RatePerRound -> RelTime -> RatePerDay
+ratePerRoundToRatePerDay perRound tickDuration =
+  -- Note: not using the 'relTimeToDays' function here to reduce the magnitude of rounding errors
+  RatePerDay with rate = perRound.rate * (microsPerDay / relTimeToMicros tickDuration)

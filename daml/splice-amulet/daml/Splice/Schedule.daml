@@ -7,6 +7,10 @@ module Splice.Schedule where
 
 import DA.Functor ()
 import DA.List (dedupSort, head)
+import Splice.Util
+import DA.Map()
+import qualified DA.Map as Map
+import DA.Time
 
 -- | A schedule of values that change over time.
 data Schedule t a = Schedule with
@@ -30,6 +34,17 @@ getValueAsOf time schedule =
           schedule.initialValue
       | otherwise ->
           getValueAsOf time Schedule with initialValue = value; futureValues
+
+-- | Variant of `getValueAsOf` that communicates workflow-level bounds.
+getValueAsOfLedgerTime : Schedule Time a -> Update a
+getValueAsOfLedgerTime schedule = do
+  case schedule.futureValues of
+    [] -> pure schedule.initialValue
+    ((effectiveAsOf, value) :: futureValues) -> do
+      notYetEffective <- isLedgerTimeLT effectiveAsOf
+      if notYetEffective
+        then pure schedule.initialValue
+        else getValueAsOfLedgerTime Schedule with initialValue = value; futureValues
 
 -- | Check the validity of a schedule given a function to check the validity of its values
 validSchedule : Ord t => Schedule t a -> (a -> Bool) -> Bool
@@ -84,3 +99,8 @@ update item schedule =
       initialValue = schedule.initialValue
       futureValues = prefix ++ [item] ++ suffix
     None -> error "No future value was found at this time."
+
+instance (Patchable t, Patchable a, Ord t, Eq a) => Patchable (Schedule t a) where
+  patch new base current = Schedule with
+     initialValue = patch new.initialValue base.initialValue current.initialValue
+     futureValues = Map.toList (patch (Map.fromList new.futureValues) (Map.fromList base.futureValues) (Map.fromList current.futureValues))

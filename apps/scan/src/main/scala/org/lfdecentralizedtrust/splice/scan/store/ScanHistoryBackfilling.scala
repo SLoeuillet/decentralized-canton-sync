@@ -4,14 +4,14 @@
 package org.lfdecentralizedtrust.splice.scan.store
 
 import com.daml.ledger.javaapi.data as javaApi
-import com.daml.metrics.api.MetricHandle.LabeledMetricsFactory
-import org.lfdecentralizedtrust.splice.environment.ledger.api.{LedgerClient, TransactionTreeUpdate}
+import org.lfdecentralizedtrust.splice.environment.ledger.api.TransactionTreeUpdate
 import org.lfdecentralizedtrust.splice.scan.admin.api.client.BackfillingScanConnection
 import org.lfdecentralizedtrust.splice.store.{HistoryBackfilling, TreeUpdateWithMigrationId}
 import org.lfdecentralizedtrust.splice.store.HistoryBackfilling.{Outcome, SourceMigrationInfo}
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.UpdateHistoryResponse
 import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.logging.{NamedLoggerFactory, NamedLogging}
-import com.digitalasset.canton.topology.{DomainId, PartyId}
+import com.digitalasset.canton.topology.{SynchronizerId, PartyId}
 import com.digitalasset.canton.tracing.TraceContext
 
 import scala.concurrent.{ExecutionContextExecutor, Future}
@@ -27,17 +27,16 @@ import scala.jdk.OptionConverters.*
   */
 class ScanHistoryBackfilling(
     connection: BackfillingScanConnection,
-    destinationHistory: HistoryBackfilling.DestinationHistory[LedgerClient.GetTreeUpdatesResponse],
+    destinationHistory: HistoryBackfilling.DestinationHistory[UpdateHistoryResponse],
     currentMigrationId: Long,
     batchSize: Int = 100,
     override val loggerFactory: NamedLoggerFactory,
-    metricsFactory: LabeledMetricsFactory,
 )(implicit
     ec: ExecutionContextExecutor
 ) extends NamedLogging {
 
   private val sourceHistory =
-    new HistoryBackfilling.SourceHistory[LedgerClient.GetTreeUpdatesResponse] {
+    new HistoryBackfilling.SourceHistory[UpdateHistoryResponse] {
       def isReady: Boolean = true
 
       def migrationInfo(migrationId: Long)(implicit
@@ -47,11 +46,11 @@ class ScanHistoryBackfilling(
 
       def items(
           migrationId: Long,
-          domainId: DomainId,
+          synchronizerId: SynchronizerId,
           before: CantonTimestamp,
           count: Int,
-      )(implicit tc: TraceContext): Future[Seq[LedgerClient.GetTreeUpdatesResponse]] =
-        connection.getUpdatesBefore(migrationId, domainId, before, None, count)
+      )(implicit tc: TraceContext): Future[Seq[UpdateHistoryResponse]] =
+        connection.getUpdatesBefore(migrationId, synchronizerId, before, None, count)
     }
 
   private val backfilling =
@@ -61,7 +60,6 @@ class ScanHistoryBackfilling(
       currentMigrationId = currentMigrationId,
       batchSize = batchSize,
       loggerFactory,
-      metricsFactory,
     )
 
   def backfill()(implicit tc: TraceContext): Future[Outcome] = {
@@ -99,12 +97,12 @@ object ScanHistoryBackfilling {
     * A create event for the `DsoBootstrap` contract, and an exercise event for the `DsoBootstrap_Bootstrap` choice.
     */
   def isFoundingTransactionTreeUpdate(
-      treeUpdate: LedgerClient.GetTreeUpdatesResponse,
+      treeUpdate: UpdateHistoryResponse,
       dsoParty: String,
   ): Boolean = {
     treeUpdate.update match {
       case TransactionTreeUpdate(tree) =>
-        val rootEvents = tree.getRootEventIds.asScala.map(tree.getEventsById.get)
+        val rootEvents = tree.getRootNodeIds.asScala.map(tree.getEventsById.get)
         rootEvents.exists {
           case created: javaApi.CreatedEvent =>
             // In `template DsoBootstrap`, the first argument is the DSO party
@@ -136,12 +134,12 @@ object ScanHistoryBackfilling {
     * `DsoRules_AddConfirmedSv` where the new SV is already part of the DSO.
     */
   def isJoiningTransactionTreeUpdate(
-      treeUpdate: LedgerClient.GetTreeUpdatesResponse,
+      treeUpdate: UpdateHistoryResponse,
       svParty: String,
   ): Boolean = {
     treeUpdate.update match {
       case TransactionTreeUpdate(tree) =>
-        val rootEvents = tree.getRootEventIds.asScala.map(tree.getEventsById.get)
+        val rootEvents = tree.getRootNodeIds.asScala.map(tree.getEventsById.get)
         rootEvents.exists {
           case exercised: javaApi.ExercisedEvent =>
             // In `choice DsoRules_AddConfirmedSv`, the first argument is the new SV party

@@ -7,6 +7,7 @@ import org.apache.pekko.stream.Materializer
 import org.lfdecentralizedtrust.splice.automation.{
   AutomationServiceCompanion,
   SpliceAppAutomationService,
+  TxLogBackfillingTrigger,
 }
 import org.lfdecentralizedtrust.splice.config.UpgradesConfig
 import org.lfdecentralizedtrust.splice.environment.{
@@ -56,7 +57,12 @@ class ScanAutomationService(
       DomainTimeSynchronization.Noop,
       DomainUnpausedSynchronization.Noop,
       store,
-      PackageIdResolver.inferFromAmuletRules(clock, store, loggerFactory),
+      PackageIdResolver.inferFromAmuletRulesIfEnabled(
+        config.parameters.enableCantonPackageSelection,
+        clock,
+        store,
+        loggerFactory,
+      ),
       ledgerClient,
       retryProvider,
       ingestFromParticipantBegin,
@@ -90,6 +96,15 @@ class ScanAutomationService(
       triggerContext,
     )
   )
+  if (config.txLogBackfillEnabled) {
+    registerTrigger(
+      new TxLogBackfillingTrigger(
+        store,
+        config.txLogBackfillBatchSize,
+        triggerContext,
+      )
+    )
+  }
 }
 
 object ScanAutomationService extends AutomationServiceCompanion {

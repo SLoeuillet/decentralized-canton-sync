@@ -7,17 +7,10 @@ import com.digitalasset.daml.lf.data.Time.Timestamp
 import org.lfdecentralizedtrust.splice.codegen.java.splice
 import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.VoteRequest
 import org.lfdecentralizedtrust.splice.codegen.java.splice.wallet.subscriptions as sub
-import org.lfdecentralizedtrust.splice.store.{Accepted, StoreErrors, VoteRequestOutcome}
-import org.lfdecentralizedtrust.splice.store.db.{
-  AcsRowData,
-  AcsTables,
-  IndexColumnValue,
-  TxLogRowData,
-}
-import org.lfdecentralizedtrust.splice.sv.store.{ErrorTxLogEntry, TxLogEntry, VoteRequestTxLogEntry}
+import org.lfdecentralizedtrust.splice.store.db.{AcsRowData, AcsTables, IndexColumnValue}
 import org.lfdecentralizedtrust.splice.util.Contract
 import com.digitalasset.canton.logging.{NamedLoggerFactory, NamedLogging}
-import com.digitalasset.canton.topology.{DomainId, Member, PartyId}
+import com.digitalasset.canton.topology.{SynchronizerId, Member, PartyId}
 import io.circe.Json
 
 object DsoTables extends AcsTables with NamedLogging {
@@ -50,7 +43,7 @@ object DsoTables extends AcsTables with NamedLogging {
       requesterName: Option[String] = None,
       electionRequestEpoch: Option[Long] = None,
       memberTrafficMember: Option[Member] = None,
-      memberTrafficDomain: Option[DomainId] = None,
+      memberTrafficDomain: Option[SynchronizerId] = None,
       ansEntryName: Option[String] = None,
       actionAnsEntryContextCid: Option[splice.ans.AnsEntryContext.ContractId] = None,
       actionAnsEntryContextPaymentId: Option[sub.SubscriptionInitialPayment.ContractId] = None,
@@ -97,57 +90,5 @@ object DsoTables extends AcsTables with NamedLogging {
     )
   }
 
-  case class DsoTxLogRowData(
-      entry: TxLogEntry,
-      actionName: Option[String],
-      accepted: Option[Boolean],
-      requester: Option[String],
-      effectiveAt: Option[String],
-      votedAt: Option[String],
-  ) extends TxLogRowData {
-    override def indexColumns: Seq[(String, IndexColumnValue[?])] = Seq(
-      "action_name" -> actionName.map(lengthLimited),
-      "accepted" -> accepted,
-      "requester_name" -> requester.map(lengthLimited),
-      "effective_at" -> effectiveAt.map(lengthLimited),
-      "voted_at" -> votedAt.map(lengthLimited),
-    )
-  }
-
-  object DsoTxLogRowData extends StoreErrors {
-
-    def fromTxLogEntry(record: TxLogEntry): DsoTxLogRowData = {
-      record match {
-        case err: ErrorTxLogEntry =>
-          DsoTxLogRowData(
-            entry = err,
-            actionName = None,
-            accepted = None,
-            requester = None,
-            effectiveAt = None,
-            votedAt = None,
-          )
-        case vr: VoteRequestTxLogEntry =>
-          val result = vr.result.getOrElse(throw txMissingField())
-          DsoTxLogRowData(
-            entry = vr,
-            actionName = Some(TxLogEntry.mapActionName(result.request.action)),
-            accepted = Some(VoteRequestOutcome.parse(result.outcome) match {
-              case _: Accepted => true
-              case _ => false
-            }),
-            requester = Some(result.request.requester),
-            effectiveAt = VoteRequestOutcome.parse(result.outcome).effectiveAt match {
-              case Some(effectiveAt) => Some(effectiveAt.toString)
-              case None => None
-            },
-            votedAt = Some(result.completedAt.toString),
-          )
-        case _ => throw txLogIsOfWrongType(record.getClass.getSimpleName)
-      }
-    }
-  }
-
   val acsTableName = "dso_acs_store"
-  val txLogTableName = "dso_txlog_store"
 }

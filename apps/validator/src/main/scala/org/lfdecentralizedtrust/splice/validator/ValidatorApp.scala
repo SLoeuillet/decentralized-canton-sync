@@ -49,7 +49,6 @@ import org.lfdecentralizedtrust.splice.util.{
   BackupDump,
   HasHealth,
   PackageVetting,
-  UploadablePackage,
 }
 import org.lfdecentralizedtrust.splice.validator.admin.http.*
 import org.lfdecentralizedtrust.splice.validator.automation.{
@@ -81,11 +80,11 @@ import com.digitalasset.canton.config.ProcessingTimeout
 import com.digitalasset.canton.config.RequireTypes.NonNegativeLong
 import com.digitalasset.canton.data.CantonTimestamp
 import com.digitalasset.canton.ledger.api.util.DurationConversion
-import com.digitalasset.canton.lifecycle.Lifecycle
+import com.digitalasset.canton.lifecycle.LifeCycle
 import com.digitalasset.canton.logging.{NamedLoggerFactory, TracedLogger}
 import com.digitalasset.canton.resource.Storage
 import com.digitalasset.canton.time.Clock
-import com.digitalasset.canton.topology.{DomainId, PartyId}
+import com.digitalasset.canton.topology.{SynchronizerId, PartyId}
 import com.digitalasset.canton.tracing.{TraceContext, TracerProvider}
 import io.grpc.Status
 import io.opentelemetry.api.trace.Tracer
@@ -128,8 +127,11 @@ class ValidatorApp(
     )
     with BasicDirectives {
 
-  override def packages =
-    super.packages ++ DarResources.wallet.all ++ DarResources.amuletNameService.all
+  override def packagesForJsonDecoding =
+    super.packagesForJsonDecoding ++ DarResources.wallet.all ++ DarResources.amuletNameService.all ++ DarResources.dsoGovernance.all
+
+  def packagesForUploading =
+    super.packagesForJsonDecoding ++ DarResources.wallet.all ++ DarResources.amuletNameService.all
 
   override def preInitializeBeforeLedgerConnection()(implicit
       traceContext: TraceContext
@@ -191,7 +193,7 @@ class ValidatorApp(
               loggerFactory,
             )
             domainAlreadyRegistered <- participantAdminConnection
-              .lookupDomainConnectionConfig(config.domains.global.alias)
+              .lookupSynchronizerConnectionConfig(config.domains.global.alias)
               .map(_.isDefined)
             now = clock.now
             // This is used by the ReconcileSequencerConnectionsTrigger to avoid travelling back in time if the domain time is behind this.
@@ -238,7 +240,8 @@ class ValidatorApp(
                         val readWriteConnection = ledgerClient.connection(
                           this.getClass.getSimpleName,
                           loggerFactory,
-                          PackageIdResolver.inferFromAmuletRules(
+                          PackageIdResolver.inferFromAmuletRulesIfEnabled(
+                            config.parameters.enableCantonPackageSelection,
                             clock,
                             scanConnection,
                             loggerFactory,
@@ -269,6 +272,21 @@ class ValidatorApp(
             _ <- appInitStep("Ensuring extra domains registered") {
               domainConnector.ensureExtraDomainsRegistered()
             }
+            // Prevet early to make sure we have the required packages even
+            // before the automation kicks in.
+            _ <- appInitStep("Vet packages") {
+              for {
+                amuletRules <- scanConnection.getAmuletRules()
+                domainId <- scanConnection.getAmuletRulesDomain()(traceContext)
+                packageVetting = new PackageVetting(
+                  ValidatorPackageVettingTrigger.packages,
+                  clock,
+                  participantAdminConnection,
+                  loggerFactory,
+                )
+                _ <- packageVetting.vetCurrentPackages(domainId, amuletRules)
+              } yield ()
+            }
             _ <- (config.migrateValidatorParty, config.participantBootstrappingDump) match {
               case (
                     Some(MigrateValidatorPartyConfig(scanConfig, partiesToMigrate)),
@@ -290,28 +308,25 @@ class ValidatorApp(
                     nodeIdentitiesDump <- ParticipantInitializer.getDump(
                       participantBootstrappingConfig
                     )
-                    (_, _) <- (
-                      setupDarsForAcsImport(participantAdminConnection),
-                      participantPartyMigrator
-                        .migrate(
-                          nodeIdentitiesDump,
-                          validatorPartyHint,
-                          config.ledgerApiUser,
-                          config.domains.global.alias,
-                          partyId =>
-                            getAcsSnapshotFromSingleScan(
-                              scanConfig,
-                              partyId,
-                              logger,
-                              retryProvider,
-                            ),
-                          Seq(
-                            DarResources.amulet.bootstrap,
-                            DarResources.amuletNameService.bootstrap,
+                    _ <- participantPartyMigrator
+                      .migrate(
+                        nodeIdentitiesDump,
+                        validatorPartyHint,
+                        config.ledgerApiUser,
+                        config.domains.global.alias,
+                        partyId =>
+                          getAcsSnapshotFromSingleScan(
+                            scanConfig,
+                            partyId,
+                            logger,
+                            retryProvider,
                           ),
-                          partiesToMigrate.map(_.map(party => PartyId.tryFromProtoPrimitive(party))),
+                        Seq(
+                          DarResources.amulet.bootstrap,
+                          DarResources.amuletNameService.bootstrap,
                         ),
-                    ).tupled
+                        partiesToMigrate.map(_.map(party => PartyId.tryFromProtoPrimitive(party))),
+                      )
                   } yield ()
                 }
               case (Some(_), None) =>
@@ -414,21 +429,6 @@ class ValidatorApp(
     migrationDump
   }
 
-  private def setupDarsForAcsImport(participantAdminConnection: ParticipantAdminConnection)(implicit
-      traceContext: TraceContext
-  ): Future[Unit] = {
-    // TODO(#11412): This potentially uploads versions that should not yet be uploaded. Consider using PackageVetting instead.
-    logger.info(s"Uploading dars for ACS import.")
-    val darFiles = packages.map(UploadablePackage.fromResource)
-    for {
-      _ <- participantAdminConnection.uploadDarFiles(darFiles, RetryFor.WaitingOnInitDependency)
-    } yield {
-      logger.info(
-        s"Finished Uploading dars for ACS import."
-      )
-    }
-  }
-
   private def getAcsSnapshotFromSingleScan(
       scanConfig: ScanAppClientConfig,
       partyId: PartyId,
@@ -457,12 +457,12 @@ class ValidatorApp(
       validatorParty: PartyId,
       storeWithIngestion: AppStoreWithIngestion[ValidatorStore],
       participantAdminConnection: ParticipantAdminConnection,
-      domainId: DomainId,
+      synchronizerId: SynchronizerId,
   )(implicit traceContext: TraceContext): Future[Unit] = {
     logger.info(s"Attempting to setup app $name...")
     for {
       _ <- instance.dars.traverse_(dar =>
-        participantAdminConnection.uploadDarFile(
+        participantAdminConnection.uploadDarFileWithVettingOnAllConnectedSynchronizers(
           dar,
           RetryFor.WaitingOnInitDependency,
         )
@@ -478,8 +478,8 @@ class ValidatorApp(
           Some(party),
           storeWithIngestion,
           validatorUserName = config.ledgerApiUser,
-          // we're initializing so AmuletRules is guaranteed to be on domainId
-          getAmuletRulesDomain = () => _ => Future successful domainId,
+          // we're initializing so AmuletRules is guaranteed to be on synchronizerId
+          getAmuletRulesDomain = () => _ => Future successful synchronizerId,
           participantAdminConnection,
           retryProvider,
           logger,
@@ -617,7 +617,7 @@ class ValidatorApp(
       participantAdminConnection: ParticipantAdminConnection,
       scanConnection: BftScanConnection,
   )(implicit traceContext: TraceContext) = {
-    def lookupReservedTraffic(domainId: DomainId): Future[Option[NonNegativeLong]] = {
+    def lookupReservedTraffic(synchronizerId: SynchronizerId): Future[Option[NonNegativeLong]] = {
       config.domains.global.reservedTrafficO
         .fold(Future.successful(Option.empty[NonNegativeLong]))(reservedTraffic => {
           for {
@@ -625,7 +625,7 @@ class ValidatorApp(
             amuletConfig = AmuletConfigSchedule(amuletRules).getConfigAsOf(clock.now)
             reservedTrafficO = Option.when(
               amuletConfig.decentralizedSynchronizer.requiredSynchronizers.map
-                .containsKey(domainId.toProtoPrimitive)
+                .containsKey(synchronizerId.toProtoPrimitive)
             )(reservedTraffic)
           } yield reservedTrafficO
         })
@@ -673,21 +673,6 @@ class ValidatorApp(
           retryProvider,
           loggerFactory,
         )
-      }
-      // Prevet early to make sure we have the required packages even
-      // before the automation kicks in.
-      _ <- appInitStep("Vet packages") {
-        for {
-          amuletRules <- scanConnection.getAmuletRules()
-          packageVetting = new PackageVetting(
-            ValidatorPackageVettingTrigger.packages,
-            config.prevetDuration,
-            clock,
-            participantAdminConnection,
-            loggerFactory,
-          )
-          _ <- packageVetting.vetPackages(amuletRules)
-        } yield ()
       }
 
       // Register the traffic balance service
@@ -779,6 +764,7 @@ class ValidatorApp(
             participantId,
             config.ingestFromParticipantBegin,
             config.ingestUpdateHistoryFromParticipantBegin,
+            config.parameters.enableCantonPackageSelection,
           )
           val walletManager = new UserWalletManager(
             ledgerClient,
@@ -803,12 +789,16 @@ class ValidatorApp(
             config.autoAcceptTransfers,
             config.supportsSoftDomainMigrationPoc,
             dedupDuration,
+            config.parameters.enableCantonPackageSelection,
+            txLogBackfillEnabled = config.txLogBackfillEnabled,
+            txLogBackfillingBatchSize = config.txLogBackfillBatchSize,
           )
           Some(walletManager)
         } else {
           logger.info("Not starting wallet as it's disabled")
           None
         }
+      synchronizerId <- scanConnection.getAmuletRulesDomain()(traceContext)
       automation = new ValidatorAutomationService(
         config.automation,
         config.participantIdentitiesBackup,
@@ -816,7 +806,6 @@ class ValidatorApp(
         config.domains.global.buyExtraTraffic.grpcDeadline,
         config.transferPreapproval,
         config.domains.global.url.isEmpty,
-        config.prevetDuration,
         config.svValidator,
         clock,
         domainTimeAutomationService.domainTimeSync,
@@ -845,9 +834,15 @@ class ValidatorApp(
         config.contactPoint,
         config.supportsSoftDomainMigrationPoc,
         initialSynchronizerTime,
+        config.parameters.enableCantonPackageSelection,
         loggerFactory,
+        packageVersionSupport = PackageVersionSupport.createPackageVersionSupport(
+          config.parameters.enableCantonPackageSelection,
+          scanConnection,
+          synchronizerId,
+          readOnlyLedgerConnection,
+        ),
       )
-      domainId <- scanConnection.getAmuletRulesDomain()(traceContext)
       _ <- config.appInstances.toList.traverse({ case (name, instance) =>
         appInitStep(s"Set up app instance $name") {
           setupAppInstance(
@@ -856,7 +851,7 @@ class ValidatorApp(
             validatorParty,
             automation,
             participantAdminConnection,
-            domainId,
+            synchronizerId,
           )
         }
       })
@@ -873,8 +868,8 @@ class ValidatorApp(
             knownParty = Some(validatorParty),
             automation,
             validatorUserName = config.ledgerApiUser,
-            // we're initializing so AmuletRules is guaranteed to be on domainId
-            getAmuletRulesDomain = () => _ => Future successful domainId,
+            // we're initializing so AmuletRules is guaranteed to be on synchronizerId
+            getAmuletRulesDomain = () => _ => Future successful synchronizerId,
             participantAdminConnection,
             retryProvider,
             logger,
@@ -1060,7 +1055,7 @@ object ValidatorApp {
     override def isHealthy: Boolean = storage.isActive && automation.isHealthy
 
     override def close(): Unit =
-      Lifecycle.close(
+      LifeCycle.close(
         (Seq(
           participantAdminConnection,
           automation,

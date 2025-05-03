@@ -1,9 +1,7 @@
 package org.lfdecentralizedtrust.splice.integration.tests
 
 import org.lfdecentralizedtrust.splice.codegen.java.splice.wallet.payment as paymentCodegen
-import org.lfdecentralizedtrust.splice.environment.EnvironmentImpl
 import org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition
-import org.lfdecentralizedtrust.splice.integration.tests.SpliceTests.SpliceTestConsoleEnvironment
 import org.lfdecentralizedtrust.splice.util.{
   FrontendLoginUtil,
   SpliceUtil,
@@ -12,7 +10,6 @@ import org.lfdecentralizedtrust.splice.util.{
   WalletTestUtil,
 }
 import com.digitalasset.canton.data.CantonTimestamp
-import com.digitalasset.canton.integration.BaseEnvironmentDefinition
 import org.lfdecentralizedtrust.splice.wallet.store.{
   NotificationTxLogEntry,
   TxLogEntry as walletLogEntry,
@@ -26,9 +23,10 @@ import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.jdk.OptionConverters.*
 import monocle.macros.syntax.lens.*
+import org.lfdecentralizedtrust.splice.http.v0.definitions.DamlValueEncoding.members.CompactJson
 
 class WalletTransactionHistoryFrontendIntegrationTest
-    extends FrontendIntegrationTestWithSharedEnvironment("alice", "sv1")
+    extends FrontendIntegrationTestWithSharedEnvironment("alice", "sv1", "scan")
     with WalletTestUtil
     with WalletTxLogTestUtil
     with WalletFrontendTestUtil
@@ -39,8 +37,7 @@ class WalletTransactionHistoryFrontendIntegrationTest
   override def walletAmuletPrice: java.math.BigDecimal =
     SpliceUtil.damlDecimal(amuletPrice.toDouble)
 
-  override def environmentDefinition
-      : BaseEnvironmentDefinition[EnvironmentImpl, SpliceTestConsoleEnvironment] =
+  override def environmentDefinition: SpliceEnvironmentDefinition =
     EnvironmentDefinition
       .simpleTopology1Sv(this.getClass.getSimpleName)
       .withoutAutomaticRewardsCollectionAndAmuletMerging
@@ -74,7 +71,7 @@ class WalletTransactionHistoryFrontendIntegrationTest
 
       val dsoEntry = expectedDsoAns
 
-      withFrontEnd("alice") { implicit webDriver =>
+      val updateIds = withFrontEnd("alice") { implicit webDriver =>
         actAndCheck(
           "Alice goes to her wallet", {
             browseToAliceWallet(aliceDamlUser)
@@ -183,6 +180,41 @@ class WalletTransactionHistoryFrontendIntegrationTest
               expectedAmountAmulet = BigDecimal(5),
             )
         }
+
+        txs.map(row => {
+          val updateId = readTransactionFromRow(row).updateId
+          updateId should not be empty
+          updateId
+        })
+      }
+
+      withFrontEnd("scan") { implicit webDriver =>
+        actAndCheck(
+          "Go to Scan",
+          go to s"http://localhost:${scanUIPort}",
+        )(
+          "All transactions appear also in scan UI, with the same update ID",
+          _ => {
+            updateIds.foreach(updateId => {
+              val scanActivities = findAll(className("activity-row")).toSeq
+              // Activities do not map 1:1 to updates, a single update may be broken into more than one
+              // activity in Scan, so we check for "at least 1" instead of "exactly 1"
+              forAtLeast(1, scanActivities) { activity =>
+                activity.findChildElement(className("update-id")).map(seleniumText) should be(
+                  Some(updateId)
+                )
+              }
+            })
+          },
+        )
+      }
+
+      clue("update IDs from the UI can be used for querying scan") {
+        updateIds.foreach(updateId =>
+          eventuallySucceeds() {
+            sv1ScanBackend.getUpdate(updateId, encoding = CompactJson)
+          }
+        )
       }
     }
 
@@ -358,6 +390,7 @@ class WalletTransactionHistoryFrontendIntegrationTest
             .childElement(className("tx-subtype"))
             .text
             .replaceAll("[()]", "") shouldBe "P2P Payment Failed"
+          notification.findChildElement(className("update-id")) shouldBe None
         }
       }
     }

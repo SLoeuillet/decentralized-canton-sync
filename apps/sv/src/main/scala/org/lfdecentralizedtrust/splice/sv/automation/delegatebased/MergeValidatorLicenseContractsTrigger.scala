@@ -11,9 +11,9 @@ import org.lfdecentralizedtrust.splice.automation.{
 }
 import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.DsoRules_MergeValidatorLicense
 import org.lfdecentralizedtrust.splice.codegen.java.splice.validatorlicense.ValidatorLicense
-import org.lfdecentralizedtrust.splice.environment.PackageIdResolver
+import org.lfdecentralizedtrust.splice.environment.PackageVersionSupport
 import org.lfdecentralizedtrust.splice.store.PageLimit
-import org.lfdecentralizedtrust.splice.util.{AssignedContract, Contract}
+import org.lfdecentralizedtrust.splice.util.{AssignedContract, Codec, Contract}
 import com.digitalasset.canton.tracing.TraceContext
 import io.opentelemetry.api.trace.Tracer
 import org.apache.pekko.stream.Materializer
@@ -26,6 +26,7 @@ import scala.jdk.CollectionConverters.*
 class MergeValidatorLicenseContractsTrigger(
     override protected val context: TriggerContext,
     override protected val svTaskContext: SvTaskBasedTrigger.Context,
+    packageVersionSupport: PackageVersionSupport,
 )(implicit
     override val ec: ExecutionContext,
     mat: Materializer,
@@ -45,13 +46,17 @@ class MergeValidatorLicenseContractsTrigger(
   )(implicit tc: TraceContext): Future[TaskOutcome] = {
     val validator = validatorLicense.payload.validator
     for {
-      amuletRules <- store.getAssignedAmuletRules()
-      supportsPruneAmuletConfigSchedule = PackageIdResolver.supportsMergeDuplicatedValidatorLicense(
-        context.clock.now.minus(context.config.clockSkewAutomationDelay.asJava),
-        amuletRules.payload,
-      )
+      pruneAmuletConfigScheduleFeatureSupport <- packageVersionSupport
+        .supportsMergeDuplicatedValidatorLicense(
+          Seq(
+            store.key.svParty,
+            store.key.dsoParty,
+            Codec.tryDecode(Codec.Party)(validator),
+          ),
+          context.clock.now.minus(context.config.clockSkewAutomationDelay.asJava),
+        )
       validatorLicenses <-
-        if (supportsPruneAmuletConfigSchedule) {
+        if (pruneAmuletConfigScheduleFeatureSupport.supported) {
           store.listValidatorLicensePerValidator(
             validator,
             MAX_VALIDATOR_LICENSE_CONTRACTS,
@@ -64,8 +69,12 @@ class MergeValidatorLicenseContractsTrigger(
           logger.warn(
             s"Validator $validator has ${validatorLicenses.length} Validator License contracts."
           )
-          mergeValidatorLicenseContracts(validator, validatorLicenses)
-        } else if (supportsPruneAmuletConfigSchedule) {
+          mergeValidatorLicenseContracts(
+            validator,
+            validatorLicenses,
+            pruneAmuletConfigScheduleFeatureSupport.packageIds,
+          )
+        } else if (pruneAmuletConfigScheduleFeatureSupport.supported) {
           Future.successful(
             TaskSuccess(s"Only one Validator License contract for $validator, nothing to merge.")
           )
@@ -82,6 +91,7 @@ class MergeValidatorLicenseContractsTrigger(
   private def mergeValidatorLicenseContracts(
       validator: String,
       validatorLicenses: Seq[Contract[ValidatorLicense.ContractId, ValidatorLicense]],
+      preferredPackages: Seq[String],
   )(implicit tc: TraceContext): Future[TaskOutcome] = {
     for {
       dsoRules <- store.getDsoRules()
@@ -92,6 +102,7 @@ class MergeValidatorLicenseContractsTrigger(
       _ <- svTaskContext.connection
         .submit(Seq(store.key.svParty), Seq(store.key.dsoParty), cmd)
         .noDedup
+        .withPrefferedPackage(preferredPackages)
         .yieldResult()
     } yield TaskSuccess(
       s"Merged ${validatorLicenses.length} ValidatorLicense contracts for $validator"

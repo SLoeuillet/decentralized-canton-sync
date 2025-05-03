@@ -1,5 +1,6 @@
 package org.lfdecentralizedtrust.splice.integration.tests
 
+import com.digitalasset.canton.topology.admin.grpc.TopologyStoreId
 import org.lfdecentralizedtrust.splice.codegen.java.splice.amuletconfig.{
   AmuletConfig,
   TransferConfig,
@@ -30,15 +31,43 @@ import org.lfdecentralizedtrust.splice.codegen.java.splice.dsorules.{
   DsoRules_SetConfig,
 }
 import org.lfdecentralizedtrust.splice.codegen.java.da.time.types.RelTime
+import org.lfdecentralizedtrust.splice.config.ConfigTransforms
+import org.lfdecentralizedtrust.splice.integration.EnvironmentDefinition
 import org.lfdecentralizedtrust.splice.integration.tests.SpliceTests.SpliceTestConsoleEnvironment
 import org.lfdecentralizedtrust.splice.sv.automation.delegatebased.CloseVoteRequestTrigger
+import org.lfdecentralizedtrust.splice.sv.config.SvOnboardingConfig.InitialPackageConfig
 import org.lfdecentralizedtrust.splice.util.{Codec, TriggerTestUtil}
 
 import java.time.Instant
+import java.util.Optional
 import scala.jdk.CollectionConverters.MapHasAsScala
 import scala.jdk.OptionConverters.*
 
+//TODO(#16139): adapt this test to work only with SetConfig
 class SvStateManagementIntegrationTest extends SvIntegrationTestBase with TriggerTestUtil {
+
+  // TODO(#16139): change tests to work with current version
+  private val initialPackageConfig = InitialPackageConfig(
+    amuletVersion = "0.1.7",
+    amuletNameServiceVersion = "0.1.7",
+    dsoGovernanceVersion = "0.1.10",
+    validatorLifecycleVersion = "0.1.1",
+    walletVersion = "0.1.7",
+    walletPaymentsVersion = "0.1.7",
+  )
+  // TODO(#16139): when using the latest version, this can be removed
+  override protected def runTokenStandardCliSanityCheck: Boolean = false
+
+  override def environmentDefinition: EnvironmentDefinition =
+    EnvironmentDefinition
+      .simpleTopology4Svs(this.getClass.getSimpleName)
+      .withManualStart
+      .withNoVettedPackages(implicit env => Seq(sv1Backend.participantClient))
+      .addConfigTransforms((_, config) =>
+        ConfigTransforms.updateAllSvAppFoundDsoConfigs_(
+          _.copy(initialPackageConfig = initialPackageConfig)
+        )(config)
+      )
 
   private def actionRequiring3VotesForEarlyClosing(sv: String) = new ARC_DsoRules(
     new SRARC_OffboardSv(
@@ -70,6 +99,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
         "url",
         "remove sv4",
         sv1Backend.getDsoInfo().dsoRules.payload.config.voteRequestTimeout,
+        None,
       ),
     )(
       "vote request has been created",
@@ -112,6 +142,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
         "url",
         "remove sv4",
         new RelTime(10_000_000L),
+        None,
       ),
     )(
       "vote request has been created",
@@ -151,6 +182,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
         "url",
         "add new sv",
         new RelTime(10_000_000L),
+        None,
       ),
     )(
       "vote request has been created",
@@ -286,6 +318,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
               "url",
               "remove sv3",
               sv1Backend.getDsoInfo().dsoRules.payload.config.voteRequestTimeout,
+              None,
             )
           },
         )("vote request has been created", _ => sv1Backend.listVoteRequests().loneElement)
@@ -310,7 +343,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
             }
           }
           // Stop SV3 to make sure it does not produce
-          // UNAUTHORIZED_TOPOLOGY_TRANSACTION warnings, see #11639.
+          // TOPOLOGY_UNAUTHORIZED_TRANSACTION warnings, see #11639.
           sv3Backend.stop()
         }
       },
@@ -322,10 +355,10 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
           svParties("sv2") -> Seq(Some(BigDecimal(0.005))),
           svParties("sv4") -> Seq(None),
         )
-        // Wait for the decentralized namespace change to avoid triggering in UNAUTHORIZED_TOPOLOGY_TRANSACTION
+        // Wait for the decentralized namespace change to avoid triggering in TOPOLOGY_UNAUTHORIZED_TRANSACTION
         sv1Backend.participantClient.topology.decentralized_namespaces
           .list(
-            filterStore = decentralizedSynchronizerId.filterString,
+            store = TopologyStoreId.Synchronizer(decentralizedSynchronizerId),
             filterNamespace = dsoParty.uid.namespace.toProtoPrimitive,
           )
           .loneElement
@@ -363,7 +396,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
         )
 
         val action: ActionRequiringConfirmation =
-          new ARC_DsoRules(new SRARC_SetConfig(new DsoRules_SetConfig(newConfig)))
+          new ARC_DsoRules(new SRARC_SetConfig(new DsoRules_SetConfig(newConfig, Optional.empty())))
 
         sv1Backend.createVoteRequest(
           sv1Backend.getDsoInfo().svParty.toProtoPrimitive,
@@ -371,6 +404,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
           "url",
           "description",
           sv1Backend.getDsoInfo().dsoRules.payload.config.voteRequestTimeout,
+          None,
         )
       },
     )(
@@ -468,6 +502,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
               initialValue.tickDuration,
               initialValue.packageConfig,
               java.util.Optional.empty(),
+              java.util.Optional.empty(),
             ),
           )
 
@@ -484,6 +519,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
           "url",
           "description",
           sv1Backend.getDsoInfo().dsoRules.payload.config.voteRequestTimeout,
+          None,
         )
       },
     )(
@@ -593,6 +629,7 @@ class SvStateManagementIntegrationTest extends SvIntegrationTestBase with Trigge
           "description",
           // expire in 5 seconds
           new RelTime(5_000_000L),
+          None,
         )
       },
     )(

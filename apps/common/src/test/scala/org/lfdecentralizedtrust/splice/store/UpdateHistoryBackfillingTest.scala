@@ -1,10 +1,12 @@
 package org.lfdecentralizedtrust.splice.store
 
-import com.daml.metrics.api.noop.NoOpMetricsFactory
-import org.lfdecentralizedtrust.splice.environment.ledger.api.LedgerClient
 import org.lfdecentralizedtrust.splice.store.HistoryBackfilling.SourceMigrationInfo
+import org.lfdecentralizedtrust.splice.store.UpdateHistory.BackfillingRequirement.BackfillingNotRequired
+import org.lfdecentralizedtrust.splice.util.DomainRecordTimeRange
 
 import scala.concurrent.Future
+
+import UpdateHistory.UpdateHistoryResponse
 
 class UpdateHistoryBackfillingTest extends UpdateHistoryTestBase {
 
@@ -71,6 +73,30 @@ class UpdateHistoryBackfillingTest extends UpdateHistoryTestBase {
           updatesA.map(_.update.update.updateId) should contain theSameElementsAs updatesB.map(
             _.update.update.updateId
           )
+        }
+      }
+
+      "return source info if backfilling is not required" in {
+        val storeA0 = mkStore(
+          domainMigrationId = 13,
+          participantId = participant1,
+          backfillingRequired = BackfillingNotRequired,
+        )
+        for {
+          // Create a store that has ingested some updates
+          _ <- initStore(storeA0)
+          _ <- create(domain1, validContractId(1), validOffset(1), party1, storeA0, time(1))
+          _ <- create(domain2, validContractId(2), validOffset(2), party1, storeA0, time(2))
+          // If the store doesn't need backfilling, it should return the correct info
+          // without explicit initialization of backfilling
+          infoS <- storeA0.sourceHistory.migrationInfo(13)
+        } yield {
+          infoS.value.complete shouldBe true
+          infoS.value.recordTimeRange shouldBe Map(
+            domain1 -> DomainRecordTimeRange(time(1), time(1)),
+            domain2 -> DomainRecordTimeRange(time(2), time(2)),
+          )
+          infoS.value.previousMigrationId shouldBe None
         }
       }
 
@@ -172,23 +198,22 @@ class UpdateHistoryBackfillingTest extends UpdateHistoryTestBase {
       destination: UpdateHistory,
       latestMigrationId: Long,
   ) =
-    new HistoryBackfilling[LedgerClient.GetTreeUpdatesResponse](
+    new HistoryBackfilling[UpdateHistoryResponse](
       destination.destinationHistory,
       source.sourceHistory,
       latestMigrationId,
       batchSize = 10,
       loggerFactory = loggerFactory,
-      metricsFactory = NoOpMetricsFactory,
     )
 
   private def backfillAll(
-      backfiller: HistoryBackfilling[LedgerClient.GetTreeUpdatesResponse]
+      backfiller: HistoryBackfilling[UpdateHistoryResponse]
   ): Future[Unit] = {
     def go(i: Int): Future[Unit] = {
       logger.debug(s"backfill() iteration $i")
       i should be < 100
       backfiller.backfill().flatMap {
-        case HistoryBackfilling.Outcome.MoreWorkAvailableNow => go(i + 1)
+        case HistoryBackfilling.Outcome.MoreWorkAvailableNow(_) => go(i + 1)
         case HistoryBackfilling.Outcome.MoreWorkAvailableLater => go(i + 1)
         case HistoryBackfilling.Outcome.BackfillingIsComplete => Future.unit
       }
